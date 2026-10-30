@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+from hbcdecompiler.__main__ import main, run_with_big_stack  # noqa: E402
+
+sys.exit(run_with_big_stack(main))

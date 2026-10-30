@@ -1,0 +1,43 @@
+var o = { a: 1, "b-c": 2, 3: "three", nested: { x: [1, 2, { y: "z" }] } };
+print(JSON.stringify(o));
+var k = "dyn";
+var o2 = { [k]: 1, [k + "2"]: 2, plain: 3 };
+print(JSON.stringify(o2));
+var o3 = { get g() { return 42; }, set s(v) { this._s = v; } };
+o3.s = 9;
+print(o3.g, o3._s);
+var spread = { ...o2, extra: true };
+print(JSON.stringify(spread));
+var { a, nested: { x: [first, , third] } } = o;
+print(a, first, third.y);
+var [p, q = 10, ...others] = [1, undefined, 3, 4];
+print(p, q, others);
+var arr = [1, 2, 3];
+var arr2 = [0, ...arr, 4, ...arr];
+print(arr2.length, arr2.join());
+print(Math.max(...arr), String.fromCharCode(...[72, 105]));
+var proto = { hello() { return "hi " + this.n; } };
+var child = Object.create(proto); child.n = "bob";
+print(child.hello(), "hello" in child, child.hasOwnProperty("hello"));
+delete child.n;
+print(child.n, typeof child.n, typeof proto.hello, typeof null, typeof undefined);
+var keys = [];
+for (var key in { x: 1, y: 2, z: 3 }) { if (key === "z") break; keys.push(key); }
+print(keys.join());
+var vals = [];
+for (var v of [5, 6, 7]) { if (v === 7) break; vals.push(v); }
+print(vals.join());
+function findOf(list, t) { for (const e of list) { if (e === t) return "found " + e; } return "no"; }
+print(findOf([1, 2, 3], 2), findOf([], 1));
+var m = new Map([[1, "a"], [2, "b"]]);
+var mk = [];
+for (const [kk, vv] of m) mk.push(kk + vv);
+print(mk.join());
+var holes = [1, , 3];
+print(holes.length, 1 in holes);
+var big = []; for (var i = 0; i < 20; i++) big[i] = i * i;
+print(big.filter(x => x % 2).reduce((s, x) => s + x, 0));
+print([3, 1, 2].sort((x, y) => x - y).join(), [..."abc"].reverse().join(""));
+var t = 1;
+var obj = { t, method() { return this.t; } };
+print(obj.method(), Object.keys(obj).join());

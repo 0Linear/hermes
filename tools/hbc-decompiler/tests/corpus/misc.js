@@ -1,0 +1,40 @@
+print(2 ** 10, (-2) ** 3, 7 % 3, -7 % 3, 5 / 2, 1 / 0, -1 / 0, 0 / 0);
+print(1 << 4, -16 >> 2, -16 >>> 28, 5 & 3, 5 | 3, 5 ^ 3, ~5);
+print(10n ** 3n, 7n / 2n, -5n % 3n, typeof 1n, 2n > 1, BigInt(10) + 5n);
+print("a" + 1 + 2, 1 + 2 + "a", "5" * "2", "5" - 2, +"3", +true, -"x");
+print(0.1 + 0.2, 1e21, 1e-7, 123.456, -0 === 0, Object.is(-0, 0), 1 / -0);
+var s = "Hello, World";
+print(s.length, s.toUpperCase(), s.slice(-5), s.split(", ").join("|"), s.replace(/o/g, "0"));
+var re = /(\d+)-(\d+)/;
+var mm = "10-20".match(re);
+print(mm[1], mm[2], re.test("x"), /a\/b/.source);
+var named = /(?<year>\d{4})/.exec("in 2024!");
+print(named.groups.year);
+function tag(strings, ...vals) { return strings.raw.join("_") + vals.join("+"); }
+var x = 5;
+print(tag`a${x}b${x + 1}c`, `multi
+line ${x * 2}`);
+print(`esc \` \${x} \\ ${"q"}`);
+print(typeof print, typeof {}, typeof [], typeof function () {}, typeof Symbol());
+var cnt = 0; var obj = { get v() { cnt++; return cnt; } };
+print(obj.v, obj.v, cnt);
+var a = [1, 2, 3];
+a.length = 1;
+print(a, [] + [], [] + {}, [1, [2, [3]]].toString());
+print(parseInt("42px"), parseFloat("3.5e2"), Number("0x1f"), (255).toString(16), (3.14159).toFixed(2));
+print(isNaN(NaN), [NaN].indexOf(NaN), [NaN].includes(NaN));
+var i = 0; var j = i++ + ++i; print(i, j);
+var z = (1, 2, 3); print(z);
+print(void 0, null ?? "d", 0 || "f", "" && "g");
+var o = { a: { b: null } };
+print(o?.a?.b?.c, o.x?.y, o.a.b ?? "nb");
+var date = new Date(0); print(date.getTime());
+print(JSON.stringify({ u: undefined, n: null, a: [undefined] }), JSON.parse('{"k":[1,2]}').k[1]);
+print(String(Symbol("desc")), Symbol.for("a") === Symbol.for("a"));
+print([1, 2, 3].map((v, i) => v * i), Array.from({ length: 3 }, (_, i) => i * 2));
+print(Object.entries({ a: 1, b: 2 }).map(([k, v]) => k + v).join());
+label: { print("in block"); if (x > 1) break label; print("never"); }
+var counter = 0; while (counter < 3) counter++;
+print(counter);
+print(eval("1 + 2"), (function () { return this; }).call(5) == 5);
+print("é中😀".length, "tab\there", 'q"q', "nul\0x".length);
