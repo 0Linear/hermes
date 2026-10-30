@@ -67,9 +67,6 @@ class Instruction:
     def next(self):
         return self.offset + self.size
 
-    def is_jump(self):
-        return any(t in ("Addr8", "Addr32") for t in self.types)
-
     def is_unconditional_jump(self):
         return self.op in ("Jmp", "JmpLong")
 

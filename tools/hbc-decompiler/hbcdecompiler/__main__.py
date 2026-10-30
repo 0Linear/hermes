@@ -6,6 +6,7 @@
 """Command line interface: python3 -m hbcdecompiler [options] file.hbc"""
 
 import argparse
+import struct
 import sys
 import threading
 
@@ -33,11 +34,15 @@ def main(argv=None):
     )
     args = ap.parse_args(argv)
 
-    with open(args.input, "rb") as f:
-        data = f.read()
+    try:
+        with open(args.input, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        sys.stderr.write("error: %s\n" % e)
+        return 1
     try:
         hbc = reader.HBCFile(data)
-    except reader.HBCError as e:
+    except (reader.HBCError, struct.error) as e:
         sys.stderr.write("error: %s\n" % e)
         return 1
 

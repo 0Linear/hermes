@@ -22,7 +22,6 @@ from .jsast import (
     Cond,
     Logical,
     Seq,
-    Expr,
     ExprStmt,
     FuncExpr,
     Lit,
@@ -31,11 +30,9 @@ from .jsast import (
     New,
     ObjectLit,
     Reg,
-    Return,
     SetReg,
     Spread,
     SwitchTerm,
-    Throw,
     Unary,
     VarDecl,
     stmt_exprs,
@@ -430,18 +427,10 @@ def dce(blocks):
 # ---------------------------------------------------------------------------
 
 
-class _Slot:
-    __slots__ = ("reg",)
-
-
 def _reg_count(e, n):
     if isinstance(e, Reg):
         return 1 if e.n == n else 0
     return sum(_reg_count(c, n) for c in e.children())
-
-
-def _stmt_reg_count(s, n):
-    return sum(_reg_count(e, n) for e in stmt_exprs(s))
 
 
 def _replace_one_reg(e, n, repl):
@@ -583,10 +572,6 @@ def _order_ok(s, n, p, origin):
         elif not ev > p:
             return False
     return True
-
-
-def _value_only(s):
-    return isinstance(s, SetReg)
 
 
 def _map_into(s, n, val):

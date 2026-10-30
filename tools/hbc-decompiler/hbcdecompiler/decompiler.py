@@ -9,11 +9,9 @@ function, nests closures at their creation sites and prints JavaScript."""
 import os
 import traceback
 
-from . import disasm
 from .dataflow import run_passes
 from .jsast import (
     UNDEFINED,
-    ArrayLit,
     Assign,
     Binary,
     Break,
@@ -21,7 +19,6 @@ from .jsast import (
     Comment,
     Cond,
     Continue,
-    Expr,
     ExprStmt,
     ForIn,
     FuncExpr,
@@ -45,7 +42,6 @@ from .jsast import (
     child_blocks,
     is_identifier,
     negate,
-    quote_string,
     simplify_bool,
     stmt_exprs,
     walk_expr,
@@ -212,8 +208,6 @@ class Decompiler:
                 for x in walk_expr(e):
                     if isinstance(x, FuncExpr):
                         out.append(x.fid)
-            if isinstance(s, (Assign,)):
-                pass
         return out
 
     # ---- printing ----------------------------------------------------------
@@ -464,6 +458,17 @@ def _strip_trailing_continue(stmts, loop):
     """Remove continues that are in tail position of a loop body."""
     if not stmts:
         return stmts
+    # if (c) continue; S (ending in a jump)  ->  if (!c) { S }
+    for i, st in enumerate(stmts[:-1]):
+        if (
+            isinstance(st, If)
+            and not st.els
+            and len(st.then) == 1
+            and isinstance(st.then[0], Continue)
+            and st.then[0].label in (None, loop.label)
+            and ends_with_jump(stmts[i + 1 :])
+        ):
+            return stmts[:i] + [If(simplify_bool(negate(st.cond)), stmts[i + 1 :], [])]
     last = stmts[-1]
     if isinstance(last, Continue) and (last.label is None or last.label == loop.label):
         return stmts[:-1]
@@ -476,8 +481,38 @@ def _strip_trailing_continue(stmts, loop):
     return stmts
 
 
+def _env_store(s):
+    if isinstance(s, ExprStmt) and isinstance(s.e, Assign) and isinstance(s.e.target, Name):
+        if s.e.target.kind == "env":
+            return s.e.target.name
+    return None
+
+
+def _drop_dead_env_stores(stmts):
+    """x = <pure>; ...pure stores...; x = v;  ->  drop the first store (e.g.
+    TDZ initialization at -O0)."""
+    dead = set()
+    for i, s in enumerate(stmts):
+        name = _env_store(s)
+        if name is None or not s.e.value.pure:
+            continue
+        for t in stmts[i + 1 :]:
+            tn = _env_store(t)
+            if tn is None or any(
+                isinstance(x, Name) and x.name == name for x in walk_expr(t.e.value)
+            ):
+                break
+            if tn == name:
+                dead.add(i)
+                break
+            if not t.e.value.pure:
+                break
+    return [s for i, s in enumerate(stmts) if i not in dead] if dead else stmts
+
+
 def cleanup(stmts, loop_depth):
     out = []
+    stmts = _drop_dead_env_stores(stmts)
     for s in stmts:
         if isinstance(s, If):
             s.cond = simplify_bool(s.cond)
@@ -676,7 +711,7 @@ def _loop_form(loop):
         and body[-2].then[0].label in (None, loop.label)
     ):
         rest = body[:-2]
-        if not _contains_continue_to(rest, loop) and not _breaks_inside_to(rest):
+        if not _contains_continue_to(rest, loop):
             loop.kind = "dowhile"
             loop.cond = body[-2].cond
             loop.body = rest
@@ -695,10 +730,6 @@ def _loop_form(loop):
             loop.kind = "dowhile"
             loop.cond = simplify_bool(negate(body[-1].cond))
             loop.body = rest
-
-
-def _breaks_inside_to(stmts):
-    return False
 
 
 # ---------------------------------------------------------------------------

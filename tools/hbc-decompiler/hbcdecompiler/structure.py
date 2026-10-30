@@ -365,6 +365,7 @@ class Structurer:
         self.g = Graph(blocks)
         self.emitted = set()
         self.dup_budget = 32
+        self.retry_budget = 64
         self.copying = frozenset()
         self.label_counter = 0
         self.regions = {}
@@ -615,6 +616,71 @@ class Structurer:
         return f
 
     def emit_if(self, n, t, ctx):
+        if self.retry_budget <= 0:
+            return self.emit_plain_if(n, t, ctx)
+        snap = (set(self.emitted), self.dup_budget, self.label_counter)
+        try:
+            return self.emit_plain_if(n, t, ctx)
+        except Unstructurable:
+            if self.retry_budget <= 0:
+                raise
+            self.retry_budget -= 1
+            self.emitted, self.dup_budget, self.label_counter = snap[0], snap[1], snap[2]
+            res = self.emit_join_if(n, t, ctx)
+            if res is None:
+                raise
+            return res
+
+    def _reach(self, start, n, stop, ctx):
+        """Nodes reachable from start (dominated by n) without passing stop
+        or enclosing jump targets."""
+        targets = {stop, n}
+        for br in ctx.breakables:
+            targets.add(br.brk)
+            if br.cont is not None:
+                targets.add(br.cont)
+        seen = set()
+        stack = [start]
+        while stack:
+            x = stack.pop()
+            if x in seen or x in targets or x not in ctx.region:
+                continue
+            if not dominates(self.g.idom, n, x):
+                continue
+            seen.add(x)
+            stack.extend(self.blocks[x].succs)
+        return seen
+
+    def emit_join_if(self, n, t, ctx):
+        """if/else whose branches re-join at a node X other than the
+        post-dominator F:  F: { if (c) {...} else {... break F; ...} X... }"""
+        follow = self.clip_follow(self.g.post_dominator(n), ctx)
+        ra = self._reach(t.t, n, follow, ctx)
+        rb = self._reach(t.f, n, follow, ctx)
+        joins = (ra & rb) - set(self.g.loops)
+        if not joins:
+            return None
+        x = min(joins, key=lambda k: self.g.rpo_index.get(k, 0))
+        if self.blocks[t.f].start < self.blocks[t.t].start:
+            cond, a, b = negate(t.cond), t.f, t.t
+        else:
+            cond, a, b = t.cond, t.t, t.f
+        brs = ctx.breakables
+        node = None
+        if follow is not None:
+            node = Labeled(self.new_label().replace("loop", "blk"), [])
+            brs = brs + [Breakable("block", follow, None, node)]
+        inner = ctx.but(follow=x, breakables=brs)
+        then = self.seq(a, inner) if a != x else []
+        els = self.seq(b, inner) if b != x else []
+        stmt = If(cond, then, els)
+        if node is None:
+            return stmt, x
+        rest = self.seq(x, ctx.but(follow=follow, breakables=brs))
+        node.body = [stmt] + rest
+        return node, follow
+
+    def emit_plain_if(self, n, t, ctx):
         follow = self.clip_follow(self.g.post_dominator(n), ctx)
         # Put the fall-through (lexically next) block in the `then` branch, as
         # source `if` statements usually jump over the then-block.

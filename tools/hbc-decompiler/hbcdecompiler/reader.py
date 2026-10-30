@@ -381,8 +381,3 @@ class HBCFile:
 
     def bytecode(self, func):
         return self.data[func.offset : func.offset + func.bytecodeSize]
-
-    def regexp_source(self, idx):
-        """Regexp table entries only hold compiled regex bytecode; the pattern
-        and flags strings are operands of CreateRegExp."""
-        return self.regexps[idx] if idx < len(self.regexps) else None

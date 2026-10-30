@@ -5,8 +5,8 @@
 
 """Lift decoded HBC instructions into the flat register IR (jsast)."""
 
-from . import disasm, tables
-from .disasm import STRING_OPERANDS, StrRef
+from . import disasm
+from .disasm import StrRef
 from .jsast import (
     EMPTY,
     UNDEFINED,
@@ -17,7 +17,6 @@ from .jsast import (
     Branch,
     Call,
     Comment,
-    Cond,
     Debugger,
     EnvRef,
     Expr,
@@ -28,7 +27,6 @@ from .jsast import (
     Logical,
     Member,
     Name,
-    New,
     ObjectLit,
     Raw,
     Reg,
