@@ -1,0 +1,8 @@
+finally1
+finally2
+f3 0
+f3 1
+f3 2
+inner finally
+try caught 1 2 TypeError:inner anon catch ok 1,true 2 a0f;c1fa2f; true xy
+MyErr custom true true

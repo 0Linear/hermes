@@ -1,0 +1,12 @@
+0,1,2,3,4
+got hello
+cleanup
+{"value":1,"done":false} {"value":2,"done":false} {"value":9,"done":true} {"done":true}
+0,1,2,3
+0,1,1,2,3,5,8,13,21,34
+x,y
+caught err
+handled rej
+async 3
+arrow 0,1,2
+seq 6

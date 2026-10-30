@@ -108,8 +108,19 @@ class Decompiler:
             fl = FunctionLifter(self, f)
             blocks = fl.lift(self.closure_env.get(fid))
             for child, env in fl.children.items():
-                if self.closure_env.get(child) is None:
+                old = self.closure_env.get(child)
+                if old is None:
                     self.closure_env[child] = env
+                elif (
+                    env is not None
+                    and env.find() is not old.find()
+                    and env.size == old.size
+                    and not _env_in_chain(old, self.closure_env.get(fid))
+                ):
+                    # The same closure created in different (inlined) copies
+                    # of an environment: give them the same variables (unless
+                    # one copy is nested in the other's scope).
+                    env.find().rep = old.find()
                 self.parent.setdefault(child, fid)
             df.params = ["a%d" % i for i in range(max(0, fl.max_param))]
             df.unknown_env = fl.unknown_env
@@ -207,6 +218,8 @@ class Decompiler:
 
     # ---- printing ----------------------------------------------------------
     def render(self):
+        self.render_stack = []
+        self.cyclic = self.find_cycles()
         printer = Printer(func_printer=self.render_func)
         out = []
         g = self.hbc.header["globalCodeIndex"]
@@ -256,8 +269,74 @@ class Decompiler:
         names = ["r%d" % r for r in sorted(regs)]
         return names + df.hoisted
 
+    def find_cycles(self):
+        """Functions that (transitively) create closures of themselves."""
+        kids = {fid: set(self.children_of(fid)) for fid in self.funcs}
+        cyclic = set()
+        index = {}
+        low = {}
+        stack = []
+        on = set()
+        counter = [0]
+
+        def strong(v):
+            # Iterative Tarjan SCC.
+            work = [(v, iter(kids.get(v, ())))]
+            index[v] = low[v] = counter[0]
+            counter[0] += 1
+            stack.append(v)
+            on.add(v)
+            while work:
+                n, it = work[-1]
+                for w in it:
+                    if w not in index:
+                        index[w] = low[w] = counter[0]
+                        counter[0] += 1
+                        stack.append(w)
+                        on.add(w)
+                        work.append((w, iter(kids.get(w, ()))))
+                        break
+                    if w in on:
+                        low[n] = min(low[n], index[w])
+                else:
+                    work.pop()
+                    if work:
+                        low[work[-1][0]] = min(low[work[-1][0]], low[n])
+                    if low[n] == index[n]:
+                        comp = []
+                        while True:
+                            w = stack.pop()
+                            on.discard(w)
+                            comp.append(w)
+                            if w == n:
+                                break
+                        if len(comp) > 1 or n in kids.get(n, ()):
+                            cyclic.update(comp)
+
+        for v in kids:
+            if v not in index:
+                strong(v)
+        return cyclic
+
+    def binding_name(self, fid):
+        df = self.funcs[fid]
+        if df.name and not _references_name(df.body, df.name):
+            return df.name
+        return "$f%d" % fid
+
     def render_func(self, fe, indent, method=None):
         printer = Printer(func_printer=self.render_func)
+        if fe.fid in self.render_stack:
+            # A closure of a function that is being printed (e.g. an inlined
+            # recursive function expression): refer to it by name.
+            return "%s /* closure #%d */" % (self.binding_name(fe.fid), fe.fid)
+        self.render_stack.append(fe.fid)
+        try:
+            return self._render_func(fe, indent, method, printer)
+        finally:
+            self.render_stack.pop()
+
+    def _render_func(self, fe, indent, method, printer):
         df = self.funcs.get(fe.fid)
         if df is None:
             self.process(fe.fid)
@@ -267,6 +346,9 @@ class Decompiler:
         name = df.name
         if name and _references_name(df.body, name):
             name = ""
+        cyclic = fe.fid in self.cyclic
+        if cyclic:
+            name = self.binding_name(fe.fid)
         if self.options.get("annotate", True):
             fn = self.hbc.functions[fe.fid]
             info = "#%d" % fe.fid
@@ -290,13 +372,24 @@ class Decompiler:
         fn = self.hbc.functions[fe.fid]
         if method:
             head = "%s(%s) {" % (method, ", ".join(df.params))
-        elif fn.prohibitInvoke == 1 and not _uses_own_bindings(df.body):
+        elif fn.prohibitInvoke == 1 and not cyclic and not _uses_own_bindings(df.body):
             # Not constructible and no own this/arguments/new.target: an
             # arrow function has exactly these semantics.
             head = "(%s) => {" % ", ".join(df.params)
         else:
             head = "function %s(%s) {" % (name, ", ".join(df.params))
         return "\n".join([head] + lines + [printer.unit * indent + "}"])
+
+
+def _env_in_chain(env, chain):
+    target = env.find()
+    depth = 0
+    while chain is not None and depth < 1000:
+        if chain.find() is target:
+            return True
+        chain = chain.parent
+        depth += 1
+    return False
 
 
 def _uses_own_bindings(body):
@@ -616,18 +709,33 @@ def _breaks_inside_to(stmts):
 def _rewrite_expr(e):
     from .jsast import transform
 
+    def is_concat(e):
+        return (
+            isinstance(e, Member)
+            and isinstance(e.obj, Name)
+            and e.obj.name == "HermesInternal"
+            and isinstance(e.key, Lit)
+            and e.key.v == "concat"
+        )
+
     def fn(x):
-        if (
+        # HermesInternal.concat.call(s0, s1, ...) builds template literals; it
+        # converts `this` and every argument with ToString.
+        args = None
+        if isinstance(x, Call) and is_concat(x.callee) and x.args:
+            args = x.args
+        elif (
             isinstance(x, Call)
             and isinstance(x.callee, Member)
-            and isinstance(x.callee.obj, Name)
-            and x.callee.obj.name == "HermesInternal"
+            and is_concat(x.callee.obj)
             and isinstance(x.callee.key, Lit)
-            and x.callee.key.v == "concat"
+            and x.callee.key.v == "call"
             and x.args
         ):
+            args = x.args
+        if args is not None:
             parts = []
-            for a in x.args:
+            for a in args:
                 if isinstance(a, Lit) and isinstance(a.v, str):
                     parts.append(a.v)
                 else:
@@ -931,19 +1039,21 @@ def _refs_outside(body, container, idx, names):
     return scan(body, False)
 
 
-def _stmt_refs(s, names):
+def _stmt_refs(s, names, seen=None):
+    seen = set() if seen is None else seen
     for e in stmt_exprs(s):
         for x in walk_expr(e):
             if isinstance(x, Name) and x.name in names:
                 return True
-            if isinstance(x, FuncExpr) and x.func is not None:
-                if _body_refs(x.func.body, names):
+            if isinstance(x, FuncExpr) and x.func is not None and x.fid not in seen:
+                seen.add(x.fid)
+                if _body_refs(x.func.body, names, seen):
                     return True
     return False
 
 
-def _body_refs(body, names):
+def _body_refs(body, names, seen):
     for s in walk_stmts(body):
-        if _stmt_refs(s, names):
+        if _stmt_refs(s, names, seen):
             return True
     return False

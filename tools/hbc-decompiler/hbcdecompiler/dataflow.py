@@ -277,11 +277,19 @@ def _propagatable(e):
 
 
 def constant_propagate(blocks):
+    # Only registers with at least one propagatable definition matter.
+    interesting = set()
+    for b in blocks:
+        for s in b.stmts:
+            if isinstance(s, SetReg) and _propagatable(s.value):
+                interesting.add(s.reg)
+    if not interesting:
+        return False
     defs = []  # (block id, stmt)
     reg_defs = {}  # reg -> bitmask of def ids
     for b in blocks:
         for s in b.stmts:
-            if isinstance(s, SetReg):
+            if isinstance(s, SetReg) and s.reg in interesting:
                 idx = len(defs)
                 defs.append(s)
                 reg_defs[s.reg] = reg_defs.get(s.reg, 0) | (1 << idx)
@@ -304,7 +312,7 @@ def constant_propagate(blocks):
         k = 0
         a = 0
         for s in b.stmts:
-            if isinstance(s, SetReg):
+            if isinstance(s, SetReg) and s.reg in interesting:
                 bit = 1 << di
                 di += 1
                 g = (g & ~reg_defs[s.reg]) | bit
@@ -316,10 +324,11 @@ def constant_propagate(blocks):
     for r, bit in entry_bit.items():
         inn[0] |= bit
     handler_extra = [0] * n
+    order = _rpo_blocks(blocks)
     changed = True
     while changed:
         changed = False
-        for b in blocks:
+        for b in order:
             i = b.id
             x = inn[i] if i else inn[0]
             for p in b.preds:
@@ -355,13 +364,33 @@ def constant_propagate(blocks):
             if repl:
                 _map_stmt(s, lambda e: subst_regs(e, repl))
                 did = True
-            if isinstance(s, SetReg) and s in defs:
-                pass
             if isinstance(s, SetReg) and s.reg in reg_defs:
                 bit = 1 << di
                 di += 1
                 cur = (cur & ~reg_defs[s.reg]) | bit
     return did
+
+
+def _rpo_blocks(blocks):
+    seen = set()
+    post = []
+    for root in [0] + [b.id for b in blocks]:
+        if root in seen or root >= len(blocks):
+            continue
+        seen.add(root)
+        stack = [(root, iter(blocks[root].succs + blocks[root].handlers))]
+        while stack:
+            x, it = stack[-1]
+            for y in it:
+                if y not in seen:
+                    seen.add(y)
+                    stack.append((y, iter(blocks[y].succs + blocks[y].handlers)))
+                    break
+            else:
+                stack.pop()
+                post.append(blocks[x])
+    post.reverse()
+    return post
 
 
 # ---------------------------------------------------------------------------
@@ -467,12 +496,15 @@ def _fold_stmt(s, live, handler_live, out, ctx):
         if not regs:
             break
         sdef = stmt_def(s)
+        counts = {}
+        for n in regs:
+            counts[n] = counts.get(n, 0) + 1
         seen = set()
         for n in reversed(regs):
             if n in seen:
                 continue
             seen.add(n)
-            if _stmt_reg_count(s, n) != 1:
+            if counts[n] != 1:
                 continue
             if n in handler_live:
                 continue

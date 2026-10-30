@@ -1,0 +1,29 @@
+1024 -8 1 -1 2.5 Infinity -Infinity NaN
+16 -4 15 1 7 6 -6
+1000 3 -2 bigint true 15
+a12 3a 10 3 3 1 NaN
+0.30000000000000004 1e+21 1e-7 123.456 true false -Infinity
+12 HELLO, WORLD World Hello|World Hell0, W0rld
+10 20 false a\/b
+2024
+a_b_c5+6 multi
+line 10
+esc ` ${x} \ q
+function object object function symbol
+1 2 2
+1  [object Object] 1,2,3
+42 350 31 ff 3.14
+true -1 true
+2 2
+3
+undefined d f 
+undefined undefined nb
+0
+{"n":null,"a":[null]} 2
+Symbol(desc) true
+0,2,6 0,2,4
+a1,b2
+in block
+3
+3 true
+4 tab	here q"q 5

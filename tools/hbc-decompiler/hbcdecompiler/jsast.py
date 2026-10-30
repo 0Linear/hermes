@@ -569,14 +569,21 @@ class Debugger(Stmt):
 
 
 class VarDecl(Stmt):
-    """`kind names;` kind is var/let."""
+    """`kind names;` kind is var/let. For environment declarations the names
+    are derived from `env` when accessed."""
 
-    __slots__ = ("kind", "names", "env")
+    __slots__ = ("kind", "_names", "env")
 
     def __init__(self, kind, names, env=None):
         self.kind = kind
-        self.names = list(names)
+        self._names = list(names)
         self.env = env
+
+    @property
+    def names(self):
+        if self.env is not None:
+            return [self.env.slot_name(k) for k in range(self.env.size)]
+        return self._names
 
 
 # Terminators (flat IR).

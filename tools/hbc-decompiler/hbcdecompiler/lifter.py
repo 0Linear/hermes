@@ -192,6 +192,28 @@ class SelectObj(Expr):
 # ---------------------------------------------------------------------------
 
 
+class EnvName(Name):
+    """A variable in a lexical environment; its name is resolved lazily so
+    that environments can still be unified after lifting."""
+
+    __slots__ = ("env", "slot")
+
+    def __init__(self, env, slot):
+        self.env = env
+        self.slot = slot
+        self.kind = "env"
+
+    @property
+    def name(self):
+        return self.env.slot_name(self.slot)
+
+    def __eq__(self, other):
+        return isinstance(other, Name) and other.name == self.name
+
+    def __hash__(self):
+        return hash(("name", self.name))
+
+
 class Env:
     """A lexical environment created by some function."""
 
@@ -202,9 +224,18 @@ class Env:
         self.size = size
         self.kind = kind  # 'function', 'scope', 'toplevel'
         self.hoist = True
+        # Union-find representative: environments of the same function body
+        # created at several sites (e.g. after inlining) share variable names.
+        self.rep = self
+
+    def find(self):
+        e = self
+        while e.rep is not e:
+            e = e.rep
+        return e
 
     def slot_name(self, k):
-        return "e%d_%d" % (self.eid, k)
+        return "e%d_%d" % (self.find().eid, k)
 
     def __repr__(self):
         return "Env(%d)" % self.eid
@@ -533,7 +564,7 @@ class FunctionLifter:
                         if old is None:
                             self.dec.closure_slots[(e.eid, a[1])] = v
                             self.env_slots_changed = True
-                        elif old.fid != v.fid:
+                        elif old is not False and old.fid != v.fid:
                             self.dec.closure_slots[(e.eid, a[1])] = False
                 elif op in (
                     "CreateClosure",
@@ -588,7 +619,7 @@ class FunctionLifter:
         if env is None:
             self.unknown_env = True
             return Name("$unknownEnv_r%d_%d" % (reg, slot), "env")
-        return Name(env.slot_name(slot), "env")
+        return EnvName(env, slot)
 
     # ---- main lifting --------------------------------------------------
     def lift(self, closure_env):
@@ -963,21 +994,30 @@ class FunctionLifter:
             return br(Binary("!==", R(a[2]), builtin_expr(a[1])), ins.targets[0])
         return [Comment("unsupported instruction: " + disasm.format_instruction(self.hbc, ins))]
 
-    def const_before(self, ins, b, reg):
-        """The constant loaded into `reg` by the closest preceding instruction
-        in block b that writes it, or None."""
+    def const_before(self, ins, b, reg, depth=0):
+        """The constant held by `reg` just before `ins` (in block b), found by
+        following moves backwards; None if unknown."""
         idx = b.insns.index(ins)
         for prev in reversed(b.insns[:idx]):
             if reg in _defined_regs(prev):
-                if prev.op in ("LoadConstUInt8", "LoadConstInt"):
-                    return prev.args[1]
-                if prev.op == "LoadConstDouble" and prev.args[1] == int(prev.args[1]):
-                    return int(prev.args[1])
-                if prev.op == "LoadConstZero":
-                    return 0
-                if prev.op == "LoadConstUndefined":
-                    return UNDEFINED
+                v = _const_value(prev)
+                if v is not None:
+                    return v
+                if prev.op in ("Mov", "MovLong") and depth < 16:
+                    return self.const_before(prev, b, prev.args[1], depth + 1)
                 return None
+        # Not defined in this block: accept a register that only ever holds
+        # one constant in the whole function.
+        vals = set()
+        for i in self.insns:
+            if reg in _defined_regs(i):
+                v = _const_value(i)
+                if v is None:
+                    return None
+                vals.add(v if v is not UNDEFINED else "<undefined>")
+        if len(vals) == 1:
+            v = vals.pop()
+            return UNDEFINED if v == "<undefined>" else v
         return None
 
     def _env_after(self, ins):
@@ -1042,6 +1082,19 @@ class FunctionLifter:
             if meth == "exponentiationOperator" and len(args) == 2:
                 return [SetReg(dst, Binary("**", args[0], args[1]))]
         return [SetReg(dst, Call(builtin_expr(idx), args))]
+
+
+def _const_value(ins):
+    op = ins.op
+    if op in ("LoadConstUInt8", "LoadConstInt"):
+        return ins.args[1]
+    if op == "LoadConstDouble" and ins.args[1] == ins.args[1] and ins.args[1] == int(ins.args[1]):
+        return int(ins.args[1])
+    if op == "LoadConstZero":
+        return 0
+    if op == "LoadConstUndefined":
+        return UNDEFINED
+    return None
 
 
 def _ident_ok(s):
