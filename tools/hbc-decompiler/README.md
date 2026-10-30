@@ -114,7 +114,12 @@ python3 tools/hbc-decompiler/tests/run_fixtures.py
 The same round trip was run on the v98 `test/hermes` suite and on the Octane
 benchmarks. For most of the remaining differences the program inspects its own
 source: stack traces and line numbers, `Function.prototype.toString`, function
-`name` and `length`, or error message text.
+`name` and `length`, or error message text. Octane programs check their own
+results. At `-O`, richards, deltablue, raytrace, crypto, navier-stokes, splay,
+regexp, box2d, gbemu, typescript and pdfjs pass after decompilation (earley-boyer
+does not, see Limitations; it passes at `-O0`), including typescript (2.5 MB of source, 1,561
+functions, about 6 seconds to decompile) and pdfjs (one function holding
+1.1 MB of bytecode, about a minute).
 
 ## Limitations
 

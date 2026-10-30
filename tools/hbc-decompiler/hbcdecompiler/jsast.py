@@ -418,12 +418,17 @@ class ObjectLit(Expr):
 
 
 class ArrayLit(Expr):
-    """elems: list of Expr, None for holes, or ('spread', Expr)."""
+    """elems: list of Expr (possibly Spread), or None for holes."""
 
-    __slots__ = ("elems",)
+    __slots__ = ("elems", "hi")
 
     def __init__(self, elems):
         self.elems = list(elems)
+        # Highest index of an element that is neither a hole nor a constant.
+        self.hi = -1
+        for i, e in enumerate(self.elems):
+            if e is not None and not isinstance(e, Lit):
+                self.hi = i
 
     @property
     def pure(self):

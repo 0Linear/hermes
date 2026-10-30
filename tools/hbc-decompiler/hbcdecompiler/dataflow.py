@@ -74,10 +74,16 @@ def stmt_def(s):
     return s.reg if isinstance(s, SetReg) else None
 
 
-def stmt_is_pure(s):
+def _stmt_is_pure_raw(s):
     if isinstance(s, SetReg):
         return s.value.pure
     return isinstance(s, (VarDecl, Comment))
+
+
+def stmt_is_pure(s):
+    if _CACHE is not None:
+        return _info(s)[2]
+    return _stmt_is_pure_raw(s)
 
 
 def block_succs(b):
@@ -109,38 +115,62 @@ def compute_edges(blocks):
 # ---------------------------------------------------------------------------
 
 
+class LiveSet:
+    """Membership view over a register bitset."""
+
+    __slots__ = ("bits",)
+
+    def __init__(self, bits):
+        self.bits = bits
+
+    def __contains__(self, r):
+        return r is not None and (self.bits >> r) & 1 == 1
+
+    def __or__(self, other):
+        return LiveSet(self.bits | other.bits)
+
+
+def _bits(regs):
+    v = 0
+    for r in regs:
+        v |= 1 << r
+    return v
+
+
 def liveness(blocks):
-    """Return (live_in, live_out) as lists of sets indexed by block id. The
-    live-in set of a block's exception handler is part of its live-out."""
+    """Return (live_in, live_out) as lists of register bitsets indexed by
+    block id. The live-in set of a block's exception handler is part of its
+    live-out."""
     n = len(blocks)
-    use = [set() for _ in range(n)]
-    dfn = [set() for _ in range(n)]
+    use = [0] * n
+    dfn = [0] * n
     for b in blocks:
-        u, d = use[b.id], dfn[b.id]
+        u = d = 0
         for s in b.stmts + [b.term]:
             for r in stmt_uses(s):
-                if r not in d:
-                    u.add(r)
+                if not (d >> r) & 1:
+                    u |= 1 << r
             r = stmt_def(s)
             if r is not None:
-                d.add(r)
-    live_in = [set() for _ in range(n)]
-    live_out = [set() for _ in range(n)]
+                d |= 1 << r
+        use[b.id], dfn[b.id] = u, d
+    live_in = [0] * n
+    live_out = [0] * n
+    order = [b.id for b in reversed(_rpo_blocks(blocks))]
     changed = True
-    order = list(reversed(range(n)))
     while changed:
         changed = False
         for i in order:
             b = blocks[i]
-            out = set()
+            out = 0
             for s in b.succs:
                 out |= live_in[s]
+            hl = 0
             for h in b.handlers:
-                out |= live_in[h]
-            inn = use[i] | (out - dfn[i])
+                hl |= live_in[h]
+            out |= hl
             # A use in a protected block is also live across the whole block.
-            for h in b.handlers:
-                inn |= live_in[h]
+            inn = use[i] | (out & ~dfn[i]) | hl
             if out != live_out[i] or inn != live_in[i]:
                 live_out[i] = out
                 live_in[i] = inn
@@ -149,17 +179,26 @@ def liveness(blocks):
 
 
 def stmt_live_out(b, block_live_out, handler_live):
-    """Per-statement live-out sets for block b (stmts + terminator)."""
+    """Per-statement live-out sets (LiveSet) for block b (stmts + terminator),
+    restricted to registers mentioned in the block, which are the only ones
+    ever queried."""
     stmts = b.stmts + [b.term]
+    mentioned = 0
+    for s in stmts:
+        mentioned |= _bits(stmt_uses(s))
+        r = stmt_def(s)
+        if r is not None:
+            mentioned |= 1 << r
     res = [None] * len(stmts)
-    live = set(block_live_out)
+    live = block_live_out & mentioned
+    hl = handler_live & mentioned
     for i in range(len(stmts) - 1, -1, -1):
-        res[i] = live | handler_live
+        res[i] = LiveSet(live | hl)
         s = stmts[i]
         r = stmt_def(s)
         if r is not None:
-            live.discard(r)
-        live.update(stmt_uses(s))
+            live &= ~(1 << r)
+        live |= _bits(stmt_uses(s))
     return res
 
 
@@ -184,14 +223,28 @@ def _map_stmt(s, fn):
 
 
 def copy_propagate(blocks):
-    """Global copy propagation using available-copies dataflow."""
+    """Global copy propagation using available-copies dataflow (facts are
+    (dst, src) register pairs, kept as bitsets)."""
     n = len(blocks)
     if not n:
         return
-    # Facts are (dst, src) pairs.
-    gen = [None] * n
-    killregs = [None] * n
-    all_facts = set()
+    fact_index = {}
+    facts = []
+    reg_facts = {}  # reg -> bitset of facts mentioning it
+
+    def fact(d, sr):
+        k = (d, sr)
+        i = fact_index.get(k)
+        if i is None:
+            i = len(facts)
+            fact_index[k] = i
+            facts.append(k)
+            reg_facts[d] = reg_facts.get(d, 0) | (1 << i)
+            reg_facts[sr] = reg_facts.get(sr, 0) | (1 << i)
+        return i
+
+    gen = [0] * n
+    kill = [0] * n
     for b in blocks:
         avail = {}
         kr = set()
@@ -204,44 +257,53 @@ def copy_propagate(blocks):
                 del avail[k]
             if isinstance(s.value, Reg) and s.value.n != r:
                 avail[r] = s.value.n
-        gen[b.id] = set(avail.items())
-        killregs[b.id] = kr
-        all_facts |= gen[b.id]
+        g = 0
+        for d, sr in avail.items():
+            g |= 1 << fact(d, sr)
+        gen[b.id] = g
+        kill[b.id] = kr
+    kmask = [0] * n
+    for b in blocks:
+        m = 0
+        for r in kill[b.id]:
+            m |= reg_facts.get(r, 0)
+        kmask[b.id] = m
+    all_facts = (1 << len(facts)) - 1
     preds = [[] for _ in range(n)]
     for b in blocks:
-        for s in b.succs:
-            preds[s].append(b.id)
+        for sx in b.succs:
+            preds[sx].append(b.id)
     is_handler = set()
     for b in blocks:
         is_handler.update(b.handlers)
-    inn = [set() if i == 0 or i in is_handler else set(all_facts) for i in range(n)]
-    out = [None] * n
-
-    def transfer(i, x):
-        kr = killregs[i]
-        return {(d, s) for d, s in x if d not in kr and s not in kr} | gen[i]
-
-    for i in range(n):
-        out[i] = transfer(i, inn[i])
+    no_in = [i == 0 or i in is_handler or not preds[i] for i in range(n)]
+    inn = [0 if no_in[i] else all_facts for i in range(n)]
+    out = [gen[i] | (inn[i] & ~kmask[i]) for i in range(n)]
+    order = [b.id for b in _rpo_blocks(blocks)]
     changed = True
     while changed:
         changed = False
-        for b in blocks:
-            i = b.id
-            if i == 0 or i in is_handler or not preds[i]:
-                x = set()
+        for i in order:
+            if no_in[i]:
+                x = 0
             else:
-                x = None
+                x = all_facts
                 for p in preds[i]:
-                    x = set(out[p]) if x is None else (x & out[p])
+                    x &= out[p]
             if x != inn[i]:
                 inn[i] = x
-                o = transfer(i, x)
+                o = gen[i] | (x & ~kmask[i])
                 if o != out[i]:
                     out[i] = o
                 changed = True
     for b in blocks:
-        copies = dict(inn[b.id])
+        copies = {}
+        x = inn[b.id]
+        while x:
+            low = x & -x
+            d, sr = facts[low.bit_length() - 1]
+            copies[d] = sr
+            x ^= low
         new = []
         for s in b.stmts + [b.term]:
             if copies:
@@ -291,6 +353,10 @@ def constant_propagate(blocks):
                 defs.append(s)
                 reg_defs[s.reg] = reg_defs.get(s.reg, 0) | (1 << idx)
     if not defs:
+        return False
+    if (len(defs) + len(reg_defs)) * len(blocks) > 400_000_000:
+        # Too large for bitset reaching definitions; folding still inlines
+        # single-use constants.
         return False
     # Entry pseudo definitions.
     entry_bit = {}
@@ -401,7 +467,7 @@ def dce(blocks):
         live_in, live_out = liveness(blocks)
         changed = False
         for b in blocks:
-            hl = set()
+            hl = 0
             for h in b.handlers:
                 hl |= live_in[h]
             lo = stmt_live_out(b, live_out[b.id], hl)
@@ -446,35 +512,78 @@ def _defines_any(s, regs):
 
 
 def _reads(s, n):
+    if _CACHE is not None:
+        return n in _info(s)[1]
     return n in stmt_uses(s)
 
 
+# Per-block cache of statement facts used while folding: id(stmt) ->
+# [stmt, uses (frozenset), pure, original position]. Statements already in the
+# output list are not mutated, so the facts stay valid; holding the statement
+# keeps its id unique.
+_CACHE = None
+
+
+def _info(st):
+    if _CACHE is not None:
+        v = _CACHE.get(id(st))
+        if v is not None and v[0] is st:
+            return v
+    v = [st, frozenset(stmt_uses(st)), _stmt_is_pure_raw(st), -1]
+    if _CACHE is not None:
+        _CACHE[id(st)] = v
+    return v
+
+
 def fold_blocks(blocks, ctx):
+    global _CACHE
     live_in, live_out = liveness(blocks)
     for b in blocks:
-        hl = set()
+        hl = 0
         for h in b.handlers:
             hl |= live_in[h]
         lo = stmt_live_out(b, live_out[b.id], hl)
+        hls = LiveSet(hl)
         stmts = b.stmts + [b.term]
         out = []
-        for s, l in zip(stmts, lo):
-            s = _fold_stmt(s, l, hl, out, ctx)
-            if s is not None:
-                out.append(s)
+        _CACHE = {}
+        try:
+            for i, (s, l) in enumerate(zip(stmts, lo)):
+                s = _fold_stmt(s, l, hls, out, ctx, i)
+                if s is not None:
+                    _info(s)[3] = i
+                    out.append(s)
+        finally:
+            _CACHE = None
         b.term = out.pop()
         b.stmts = out
 
 
-def _fold_stmt(s, live, handler_live, out, ctx):
+FOLD_WINDOW = 256
+
+
+def _literal_target(s):
+    """The register of a literal being extended by statement s, if any."""
+    e = s.e if isinstance(s, ExprStmt) else (s.value if isinstance(s, SetReg) else None)
+    if isinstance(e, (DefineProp, DefineAccessor)) and isinstance(e.obj, Reg):
+        return e.obj.n
+    if (_is_helper_call(e, "putSlot") or _is_helper_call(e, "arraySpread")) and isinstance(
+        e.args[0], Reg
+    ):
+        return e.args[0].n
+    return None
+
+
+def _fold_stmt(s, live, handler_live, out, ctx, my_pos):
     """Fold definitions from `out` into statement s. Returns the (possibly
     replaced) statement or None if it was absorbed.
 
     Every folded expression with side effects is tagged with its original
     position, and a fold is only accepted if the evaluation order of all side
     effects in the resulting statement matches the original order."""
-    stamp = {id(st): i for i, st in enumerate(out)}
     origin = {}
+    # A literal that s extends is merged after s's own operands are folded.
+    protected = _literal_target(s)
     progress = True
     while progress:
         progress = False
@@ -493,15 +602,16 @@ def _fold_stmt(s, live, handler_live, out, ctx):
             if n in seen:
                 continue
             seen.add(n)
-            if counts[n] != 1:
+            if counts[n] != 1 or n == protected:
                 continue
             if n in handler_live:
                 continue
             if n in live and sdef != n:
                 continue
-            # Find the latest definition of n in out.
+            # Find the latest definition of n in out (temporaries are defined
+            # close to their use; bound the search for huge blocks).
             pos = None
-            for j in range(len(out) - 1, -1, -1):
+            for j in range(len(out) - 1, max(-1, len(out) - 1 - FOLD_WINDOW), -1):
                 st = out[j]
                 if stmt_def(st) == n:
                     pos = j
@@ -512,7 +622,7 @@ def _fold_stmt(s, live, handler_live, out, ctx):
                 continue
             d = out[pos]
             val = d.value
-            p = stamp.get(id(d), -1)
+            p = _info(d)[3]
             if not val.pure:
                 if any(not stmt_is_pure(out[j]) for j in range(pos + 1, len(out))):
                     continue
@@ -528,7 +638,7 @@ def _fold_stmt(s, live, handler_live, out, ctx):
             _map_into(s, n, val)
             progress = True
             break
-    return s
+    return _merge_literal(s, out, live, my_pos)
 
 
 _INF = float("inf")
@@ -645,7 +755,42 @@ def _simplify_stmt(s, out, live, ctx):
                         break
                     if _reads(st, t):
                         break
-    # Object / array literal construction.
+    return s
+
+
+def _merge_literal(s, out, live, my_pos):
+    """Object / array literal construction."""
+    tgt = _literal_target(s)
+    old = None
+    if tgt is not None and _CACHE is not None:
+        j = _find_literal_def(out, tgt)
+        if j is not None:
+            old = _info(out[j])
+    s_uses = frozenset(stmt_uses(s))
+    res = _merge_literal_1(s, out, live)
+    if res is not s and isinstance(res, SetReg) and _CACHE is not None:
+        if old is not None:
+            # Incremental facts: avoid re-walking a large literal.
+            uses = (old[1] | s_uses) - ({tgt} if tgt not in old[1] else set())
+            pure = old[2] and _value_pure(s)
+            _CACHE[id(res)] = [res, uses, pure, my_pos]
+        else:
+            _CACHE[id(res)] = [res, frozenset(stmt_uses(res)), res.value.pure, my_pos]
+    return res
+
+
+def _value_pure(s):
+    e = s.e if isinstance(s, ExprStmt) else s.value
+    if isinstance(e, DefineProp):
+        return e.key.pure and e.value.pure
+    if isinstance(e, DefineAccessor):
+        return e.key.pure
+    if isinstance(e, Call):
+        return False
+    return e.pure
+
+
+def _merge_literal_1(s, out, live):
     if isinstance(s, ExprStmt):
         e = s.e
         if isinstance(e, DefineProp) and isinstance(e.obj, Reg):
@@ -729,7 +874,7 @@ def _same_callee(a, b):
 
 
 def _find_literal_def(out, n, skip=None):
-    for j in range(len(out) - 1, -1, -1):
+    for j in range(len(out) - 1, max(-1, len(out) - 1 - FOLD_WINDOW), -1):
         if j == skip:
             continue
         st = out[j]
@@ -743,8 +888,7 @@ def _find_literal_def(out, n, skip=None):
 
 
 def _can_move_to_end(out, j):
-    lit = out[j].value
-    if lit.pure:
+    if stmt_is_pure(out[j]):
         return True
     return all(stmt_is_pure(out[k]) for k in range(j + 1, len(out)))
 
@@ -767,27 +911,28 @@ def _fold_define(s, e, out):
             if any(k in ("init", "get", "set") and kk == key for k, kk, _ in lit.props):
                 # Redefinition of an existing key: keep the order semantics.
                 return s
-            new = ObjectLit(lit.props + [("init", key, e.value)])
+            lit.props.append(("init", key, e.value))
+            new = lit
         else:
             if not e.enumerable:
                 return s
-            new = ObjectLit(lit.props + [("computed", e.key, e.value)])
+            lit.props.append(("computed", e.key, e.value))
+            new = lit
     else:
         if not (isinstance(e.key, Lit) and isinstance(e.key.v, int) and not isinstance(e.key.v, bool)):
             return s
         idx = e.key.v
-        elems = list(lit.elems)
+        elems = lit.elems
         if idx == len(elems):
             elems.append(e.value)
-        elif (
-            idx < len(elems)
-            and elems[idx] is None
-            and all(x is None or isinstance(x, Lit) for x in elems[idx + 1 :])
-        ):
+        elif idx < len(elems) and elems[idx] is None and lit.hi < idx:
+            # Only holes and constants follow, so evaluation order is kept.
             elems[idx] = e.value
         else:
             return s
-        new = ArrayLit(elems)
+        if not isinstance(e.value, Lit):
+            lit.hi = max(lit.hi, idx)
+        new = lit
     del out[j]
     return SetReg(n, new)
 
