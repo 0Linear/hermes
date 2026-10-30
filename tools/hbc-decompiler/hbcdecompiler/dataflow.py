@@ -888,6 +888,11 @@ def _find_literal_def(out, n, skip=None):
 
 
 def _can_move_to_end(out, j):
+    # Moving the literal down must not change the values of registers it
+    # reads.
+    uses = _info(out[j])[1] if _CACHE is not None else set(stmt_uses(out[j]))
+    if uses and any(stmt_def(out[k]) in uses for k in range(j + 1, len(out))):
+        return False
     if stmt_is_pure(out[j]):
         return True
     return all(stmt_is_pure(out[k]) for k in range(j + 1, len(out)))
