@@ -188,6 +188,9 @@ var $hbc = (function () {
   H.putSlot = function (o, i, v) {
     o[Reflect.ownKeys(o)[i]] = v;
   };
+  H.coerceThis = function (v) {
+    return v === undefined || v === null ? globalThis : Object(v);
+  };
   H.toNumeric = function (v) {
     var p = isObject(v) ? Number(v) : v;
     return typeof p === "bigint" ? p : +p;

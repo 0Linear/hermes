@@ -70,6 +70,7 @@ class DecompiledFunction:
         self.hoisted = []
         self.regs = []
         self.parent = None
+        self.unknown_env = False
 
 
 class Decompiler:
@@ -81,6 +82,9 @@ class Decompiler:
         self.closure_env = {}
         self.env_slots = {}
         self.env_container = {}
+        self.closure_slots = {}
+        self.created_envs = {}
+        self.generator_inner = set()
         self.parent = {}
         self.funcs = {}
         self.stats = {"functions": 0, "fallback": 0, "errors": 0}
@@ -108,6 +112,7 @@ class Decompiler:
                     self.closure_env[child] = env
                 self.parent.setdefault(child, fid)
             df.params = ["a%d" % i for i in range(max(0, fl.max_param))]
+            df.unknown_env = fl.unknown_env
             run_passes(blocks, self)
             body, fell_back = structure(blocks)
             df.fallback = fell_back
@@ -116,6 +121,7 @@ class Decompiler:
             body = cleanup(body, loop_depth=0)
             body = final_rewrites(body)
             body = cleanup(body, loop_depth=0)
+            body = recognize_for_loops(body)
             body = strip_tail_return(body)
             df.body = body
             df.envs = fl.envs_created
@@ -158,6 +164,19 @@ class Decompiler:
                         if child not in seen:
                             seen.add(child)
                             queue2.append(child)
+        # Environments reached through other environments' slots may only be
+        # known after later functions were analyzed; retry those functions.
+        for _ in range(2):
+            retry = [fid for fid, df in self.funcs.items() if df.unknown_env]
+            if not retry:
+                break
+            for fid in retry:
+                self.stats["functions"] -= 1
+                if self.funcs[fid].fallback:
+                    self.stats["fallback"] -= 1
+                if self.funcs[fid].error:
+                    self.stats["errors"] -= 1
+                self.process(fid)
         for df in self.funcs.values():
             for s in walk_stmts(df.body):
                 for e in stmt_exprs(s):
@@ -193,8 +212,6 @@ class Decompiler:
         g = self.hbc.header["globalCodeIndex"]
         gdf = self.funcs[g]
         body = global_body(gdf.body)
-        if gdf.strict:
-            out.append('"use strict";')
         decl = self.declarations(gdf)
         if decl:
             out.append("let %s;" % ", ".join(decl))
@@ -208,6 +225,9 @@ class Decompiler:
         if "$hbc." in text:
             with open(PRELUDE_PATH) as f:
                 text = f.read() + "\n" + text
+        if gdf.strict:
+            # The directive must precede every statement, including the prelude.
+            header += '"use strict";\n'
         return header + text
 
     def header_comment(self):
@@ -267,11 +287,29 @@ class Decompiler:
         if decl:
             lines.append(pad + "let %s;" % ", ".join(decl))
         printer.stmts(df.body, indent + 1, lines)
+        fn = self.hbc.functions[fe.fid]
         if method:
             head = "%s(%s) {" % (method, ", ".join(df.params))
+        elif fn.prohibitInvoke == 1 and not _uses_own_bindings(df.body):
+            # Not constructible and no own this/arguments/new.target: an
+            # arrow function has exactly these semantics.
+            head = "(%s) => {" % ", ".join(df.params)
         else:
             head = "function %s(%s) {" % (name, ", ".join(df.params))
         return "\n".join([head] + lines + [printer.unit * indent + "}"])
+
+
+def _uses_own_bindings(body):
+    from .jsast import Raw
+
+    for s in walk_stmts(body):
+        for e in stmt_exprs(s):
+            for x in walk_expr(e):
+                if isinstance(x, Name) and x.kind in ("this", "arguments"):
+                    return True
+                if isinstance(x, Raw) and "new.target" in x.text:
+                    return True
+    return False
 
 
 def _references_name(body, name):
@@ -384,6 +422,19 @@ def cleanup(stmts, loop_depth):
             # Logical: r = a; if (r) r = b;  ->  r = a && b
             if out and _logical_assign(out, s):
                 continue
+            # r = a; if (c) r = b;  ->  r = c ? b : a   (a pure)
+            if (
+                out
+                and not s.els
+                and len(s.then) == 1
+                and isinstance(s.then[0], SetReg)
+                and isinstance(out[-1], SetReg)
+                and out[-1].reg == s.then[0].reg
+                and out[-1].value.pure
+                and not _expr_uses_reg(s.cond, out[-1].reg)
+            ):
+                out[-1] = SetReg(out[-1].reg, make_cond(s.cond, s.then[0].value, out[-1].value))
+                continue
             out.append(s)
         elif isinstance(s, Loop):
             s.body = cleanup(s.body, loop_depth + 1)
@@ -406,12 +457,43 @@ def cleanup(stmts, loop_depth):
             out.append(s)
         elif isinstance(s, Labeled):
             s.body = cleanup(s.body, loop_depth)
-            out.append(s)
+            s.body = _strip_trailing_break(s.body, s.label)
+            s.used_label = _contains_break_to(s.body, s.label)
+            if not s.used_label:
+                out.extend(s.body)
+            else:
+                out.append(s)
         else:
             out.append(s)
         if ends_with_jump(out):
             break
     return out
+
+
+def _strip_trailing_break(stmts, label):
+    if not stmts:
+        return stmts
+    last = stmts[-1]
+    if isinstance(last, Break) and last.label == label:
+        return stmts[:-1]
+    if isinstance(last, If):
+        last.then = _strip_trailing_break(last.then, label)
+        last.els = _strip_trailing_break(last.els, label)
+    if isinstance(last, Try):
+        last.body = _strip_trailing_break(last.body, label)
+        last.handler = _strip_trailing_break(last.handler, label)
+    return stmts
+
+
+def _contains_break_to(stmts, label):
+    for s in walk_stmts(stmts):
+        if isinstance(s, (Break, Continue)) and s.label == label:
+            return True
+    return False
+
+
+def _expr_uses_reg(e, n):
+    return any(isinstance(x, Reg) and x.n == n for x in walk_expr(e))
 
 
 def _size(stmts):
@@ -426,8 +508,17 @@ def _ternary(s):
         and isinstance(s.els[0], SetReg)
         and s.then[0].reg == s.els[0].reg
     ):
-        return SetReg(s.then[0].reg, Cond(s.cond, s.then[0].value, s.els[0].value))
+        return SetReg(s.then[0].reg, make_cond(s.cond, s.then[0].value, s.els[0].value))
     return None
+
+
+def make_cond(c, a, b):
+    """c ? a : b, preferring a non-negated condition."""
+    if (isinstance(c, Unary) and c.op == "!") or (
+        isinstance(c, Binary) and c.op in ("!==", "!=")
+    ):
+        return Cond(simplify_bool(negate(c)), b, a)
+    return Cond(c, a, b)
 
 
 def _logical_assign(out, s):
@@ -464,6 +555,13 @@ def _logical_assign(out, s):
 def _loop_form(loop):
     body = loop.body
     if loop.kind != "for":
+        return
+    if loop.update is not None:
+        if body and isinstance(body[0], If) and not body[0].els:
+            first = body[0]
+            if len(first.then) == 1 and isinstance(first.then[0], Break) and first.then[0].label is None:
+                loop.cond = simplify_bool(negate(first.cond))
+                loop.body = body[1:]
         return
     # while (c): leading `if (!c) break;`
     if body and isinstance(body[0], If) and not body[0].els:
@@ -546,6 +644,184 @@ def final_rewrites(stmts):
     for s in walk_stmts(stmts):
         map_stmt_exprs(s, _rewrite_expr)
     return stmts
+
+
+# ---------------------------------------------------------------------------
+# for-in / for-of reconstruction
+# ---------------------------------------------------------------------------
+
+
+def _helper_call(e, name):
+    return (
+        isinstance(e, Call)
+        and isinstance(e.callee, Member)
+        and isinstance(e.callee.obj, Name)
+        and e.callee.obj.name == "$hbc"
+        and isinstance(e.callee.key, Lit)
+        and e.callee.key.v == name
+    )
+
+
+def _is_reg(e, n):
+    return isinstance(e, Reg) and e.n == n
+
+
+def _is_undef_check(e, n, op="==="):
+    return (
+        isinstance(e, Binary)
+        and e.op == op
+        and _is_reg(e.l, n)
+        and isinstance(e.r, Lit)
+        and e.r.v is UNDEFINED
+    )
+
+
+def _is_break_if(s, n):
+    return (
+        isinstance(s, If)
+        and not s.els
+        and len(s.then) == 1
+        and isinstance(s.then[0], Break)
+        and s.then[0].label is None
+        and _is_undef_check(s.cond, n)
+    )
+
+
+def _reg_refs(stmts, n):
+    c = 0
+    for s in walk_stmts(stmts):
+        if isinstance(s, SetReg) and s.reg == n:
+            c += 1
+        for e in stmt_exprs(s):
+            for x in walk_expr(e):
+                if isinstance(x, Reg) and x.n == n:
+                    c += 1
+    return c
+
+
+def _remove_iter_close(stmts, n):
+    out = []
+    for s in stmts:
+        if (
+            isinstance(s, ExprStmt)
+            and _helper_call(s.e, "iterClose")
+            and _is_reg(s.e.args[0], n)
+        ):
+            continue
+        if isinstance(s, If):
+            s.then, s.els = _remove_iter_close(s.then, n), _remove_iter_close(s.els, n)
+        elif isinstance(s, (Loop, Labeled, ForIn)):
+            s.body = _remove_iter_close(s.body, n)
+        elif isinstance(s, Switch):
+            s.cases = [(l, _remove_iter_close(b, n)) for l, b in s.cases]
+        elif isinstance(s, Try):
+            s.body, s.handler = _remove_iter_close(s.body, n), _remove_iter_close(s.handler, n)
+        out.append(s)
+    return out
+
+
+def _plain_loop(s):
+    return isinstance(s, Loop) and s.kind == "for" and s.cond is None and s.update is None
+
+
+def _count_iter_close(stmts, n):
+    c = 0
+    for s in walk_stmts(stmts):
+        if isinstance(s, ExprStmt) and _helper_call(s.e, "iterClose") and _is_reg(s.e.args[0], n):
+            c += 1
+    return c
+
+
+def _make_for(kind, target_reg, obj, body, loop, root, header_refs):
+    node = ForIn(kind, Reg(target_reg), obj, body, loop.label)
+    node.used_label = loop.used_label
+    # for (x in o) { y = x; ... }  ->  for (y in o) { ... }
+    if (
+        body
+        and isinstance(body[0], ExprStmt)
+        and isinstance(body[0].e, Assign)
+        and _is_reg(body[0].e.value, target_reg)
+        and isinstance(body[0].e.target, (Name, Reg))
+        and _reg_refs(root, target_reg) == header_refs + 1
+    ):
+        node.target = body[0].e.target
+        node.body = body[1:]
+    return node
+
+
+def recognize_for_loops(body, root=None):
+    root = body if root is None else root
+    out = []
+    i = 0
+    while i < len(body):
+        s = body[i]
+        for b in child_blocks(s):
+            b[:] = recognize_for_loops(b, root)
+        nxt = body[i + 1] if i + 1 < len(body) else None
+        # ---- for-in ------------------------------------------------------
+        if isinstance(s, SetReg) and _helper_call(s.value, "forInBegin") and nxt is not None:
+            L = s.reg
+            loop = None
+            if (
+                isinstance(nxt, If)
+                and not nxt.els
+                and len(nxt.then) == 1
+                and _is_undef_check(nxt.cond, L, "!==")
+            ):
+                loop = nxt.then[0]
+            elif _plain_loop(nxt):
+                loop = nxt
+            if (
+                _plain_loop(loop)
+                and len(loop.body) >= 2
+                and isinstance(loop.body[0], SetReg)
+                and _helper_call(loop.body[0].value, "forInNext")
+                and _is_reg(loop.body[0].value.args[0], L)
+                and _is_break_if(loop.body[1], loop.body[0].reg)
+                and _reg_refs(root, L) == _reg_refs([s, nxt], L)
+                and _reg_refs(loop.body[2:], L) == 0
+            ):
+                K = loop.body[0].reg
+                out.append(_make_for("in", K, s.value.args[0], loop.body[2:], loop, root, 2))
+                i += 2
+                continue
+        # ---- for-of ------------------------------------------------------
+        if isinstance(s, SetReg) and _helper_call(s.value, "iterBegin") and _plain_loop(nxt):
+            IT = s.reg
+            lb = nxt.body
+            if (
+                len(lb) >= 3
+                and isinstance(lb[0], SetReg)
+                and _helper_call(lb[0].value, "iterNext")
+                and _is_reg(lb[0].value.args[0], IT)
+                and isinstance(lb[1], SetReg)
+                and lb[1].reg == IT
+                and _helper_call(lb[1].value, "iterAlive")
+                and _is_break_if(lb[2], IT)
+                and _reg_refs(root, IT) == _reg_refs([s, nxt], IT)
+            ):
+                rest = lb[3:]
+                if (
+                    len(rest) == 1
+                    and isinstance(rest[0], Try)
+                    and len(rest[0].handler) == 2
+                    and isinstance(rest[0].handler[0], ExprStmt)
+                    and _helper_call(rest[0].handler[0].e, "iterClose")
+                    and _is_reg(rest[0].handler[0].e.args[0], IT)
+                    and isinstance(rest[0].handler[1], Throw)
+                    and isinstance(rest[0].handler[1].e, Name)
+                    and rest[0].handler[1].e.name == rest[0].param
+                ):
+                    rest = rest[0].body
+                if _reg_refs(rest, IT) == _count_iter_close(rest, IT):
+                    rest = _remove_iter_close(rest, IT)
+                    V = lb[0].reg
+                    out.append(_make_for("of", V, s.value.args[0], rest, nxt, root, 1))
+                    i += 2
+                    continue
+        out.append(s)
+        i += 1
+    return out
 
 
 def strip_tail_return(body):

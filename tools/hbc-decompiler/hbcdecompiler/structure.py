@@ -23,13 +23,17 @@ from .jsast import (
     Comment,
     Continue,
     ExprStmt,
+    FuncExpr,
     If,
     Jump,
+    Labeled,
     Lit,
     Logical,
     Loop,
     Name,
+    Reg,
     Return,
+    Seq,
     SetReg,
     Switch,
     SwitchTerm,
@@ -211,6 +215,58 @@ class Graph:
 # ---------------------------------------------------------------------------
 
 
+def _truthiness(e):
+    """Static truthiness of a branch condition, or None if unknown."""
+    from .jsast import EMPTY, UNDEFINED, BigIntValue, Unary
+
+    if isinstance(e, Unary) and e.op == "!":
+        t = _truthiness(e.e)
+        return None if t is None else not t
+    if not isinstance(e, Lit):
+        return None
+    v = e.v
+    if v is None or v is UNDEFINED or v is EMPTY:
+        return False
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v != ""
+    if isinstance(v, BigIntValue):
+        return v.v != 0
+    if isinstance(v, (int, float)):
+        return not (v == 0 or v != v)
+    return None
+
+
+def fold_constant_branches(blocks):
+    changed = False
+    for b in blocks:
+        t = b.term
+        if isinstance(t, Branch):
+            tv = _truthiness(t.cond)
+            if tv is not None:
+                b.term = Jump(t.t if tv else t.f)
+                changed = True
+            elif t.t == t.f:
+                if t.cond.pure:
+                    b.term = Jump(t.t)
+                else:
+                    b.stmts.append(ExprStmt(t.cond))
+                    b.term = Jump(t.t)
+                changed = True
+    compute_edges(blocks)
+    reach = set(reverse_postorder(blocks, 0, all_succs)) if blocks else set()
+    for b in blocks:
+        if b.id not in reach and (b.stmts or not isinstance(b.term, Unreachable)):
+            b.stmts = []
+            b.term = Unreachable()
+            b.handlers = []
+            changed = True
+    if changed:
+        compute_edges(blocks)
+    return changed
+
+
 def merge_conditions(blocks):
     """Merge `if (a) goto B else Y; B: if (b) ...` chains into a single
     branch on `a && b` / `a || b` when B is otherwise empty."""
@@ -308,6 +364,8 @@ class Structurer:
         self.blocks = blocks
         self.g = Graph(blocks)
         self.emitted = set()
+        self.dup_budget = 32
+        self.copying = frozenset()
         self.label_counter = 0
         self.regions = {}
         for b in blocks:
@@ -329,6 +387,11 @@ class Structurer:
         innermost_loop = True
         innermost = True
         for br in reversed(ctx.breakables):
+            if br.kind == "block":
+                if n == br.brk:
+                    br.node.used_label = True
+                    return Break(br.node.label)
+                continue
             if br.kind == "loop" and n == br.cont:
                 if not innermost_loop:
                     br.node.used_label = True
@@ -367,16 +430,102 @@ class Structurer:
                 return False
         return True
 
+    def terminal_subgraph(self, n, ctx):
+        """If every path from n reaches a return/throw within a small acyclic
+        sub-graph with the same try nesting, return its node set."""
+        blocks = self.blocks
+        nodes = set()
+        order = []
+        stmts = 0
+        state = {}
+
+        def visit(x):
+            nonlocal stmts
+            if state.get(x) == 1:
+                return False  # cycle
+            if state.get(x) == 2:
+                return True
+            b = blocks[x]
+            if x in self.g.loops:
+                return False
+            if b.handlers != ctx.open:
+                # Copying into a different try nesting is only safe for code
+                # that cannot throw.
+                if not all(isinstance(st, SetReg) and st.value.pure for st in b.stmts):
+                    return False
+                t = b.term
+                if not (
+                    (isinstance(t, Return) and (t.e is None or t.e.pure))
+                    or isinstance(t, Jump)
+                ):
+                    return False
+            if isinstance(b.term, (Unreachable, SwitchTerm)):
+                return False
+            for st in b.stmts:
+                if isinstance(st, VarDecl):
+                    return False
+                for e in stmt_exprs(st):
+                    if any(isinstance(y, (CaughtValue, FuncExpr)) for y in walk_expr(e)):
+                        return False
+            state[x] = 1
+            nodes.add(x)
+            stmts += len(b.stmts) + 1
+            if len(nodes) > 8 or stmts > 12:
+                return False
+            for sx in b.succs:
+                if not visit(sx):
+                    return False
+            state[x] = 2
+            order.append(x)
+            return True
+
+        if not visit(n):
+            return None
+        return nodes
+
+    def emit_copy(self, n, nodes, ctx):
+        saved = self.emitted
+        saved_copying = self.copying
+        self.emitted = set(saved) - nodes
+        self.copying = saved_copying | {x for x in nodes if self.blocks[x].handlers != ctx.open}
+        try:
+            out = self.seq(n, ctx.but(region=ctx.region | nodes, follow=None, fallthrough=None))
+        finally:
+            self.emitted = saved
+            self.copying = saved_copying
+        return _clone(out)
+
+    def tail_dupable(self, n, ctx):
+        """Small straight-line blocks may be duplicated on each path that
+        reaches them (e.g. switch fall-through lowered to if-chains)."""
+        b = self.blocks[n]
+        if not isinstance(b.term, Jump) or len(b.stmts) > 3:
+            return False
+        if b.handlers != ctx.open or n in self.g.loops:
+            return False
+        if self.dup_budget <= 0:
+            return False
+        for st in b.stmts:
+            if not isinstance(st, (SetReg, ExprStmt)):
+                return False
+            for e in stmt_exprs(st):
+                if any(isinstance(x, (CaughtValue, FuncExpr)) for x in walk_expr(e)):
+                    return False
+        self.dup_budget -= 1
+        return True
+
     def dup(self, n):
         b = self.blocks[n]
         return [copy.copy(s) for s in b.stmts] + [copy.copy(b.term)]
 
     # ---- sequences -------------------------------------------------------
-    def seq(self, n, ctx, first=False):
+    def seq(self, n, ctx, first=False, entry=False):
+        """Emit code starting at block n. `first` marks n as the header of the
+        loop being emitted; `entry` skips jump resolution for n."""
         out = []
         blocks = self.blocks
         while n is not None:
-            if not first:
+            if not first and not entry:
                 if n == ctx.follow:
                     break
                 j = self.resolve_jump(n, ctx)
@@ -389,27 +538,49 @@ class Structurer:
                 if self.dupable(n, ctx):
                     out.extend(self.dup(n))
                     break
+                sub = self.terminal_subgraph(n, ctx) if self.dup_budget > 0 else None
+                if sub is not None:
+                    self.dup_budget -= 1
+                    out.extend(self.emit_copy(n, sub, ctx))
+                    break
                 raise Unstructurable("jump out of region to B%d@%d" % (n, self.blocks[n].start))
+            entry = False
             b = blocks[n]
-            if not first and len(b.handlers) > len(ctx.open):
+            want_try = len(b.handlers) > len(ctx.open)
+            want_loop = not first and n in self.g.loops and n not in ctx.active_loops
+            if want_try and want_loop:
+                h = b.handlers[len(ctx.open)]
+                if not self.g.loops[n] <= self.regions.get(h, set()):
+                    want_try = False
+            if want_try:
                 if b.handlers[: len(ctx.open)] != ctx.open:
                     raise Unstructurable("mismatched try nesting")
                 h = b.handlers[len(ctx.open)]
                 stmt, n = self.emit_try(n, h, ctx)
                 out.append(stmt)
                 continue
-            if b.handlers[: len(ctx.open)] != ctx.open[: len(b.handlers)] or len(
-                b.handlers
-            ) < len(ctx.open):
-                raise Unstructurable("block outside of open try")
-            if not first and n in self.g.loops and n not in ctx.active_loops:
+            if want_loop:
                 stmt, n = self.emit_loop(n, ctx)
                 out.append(stmt)
                 continue
+            if n not in self.copying and (
+                b.handlers[: len(ctx.open)] != ctx.open[: len(b.handlers)]
+                or len(b.handlers) < len(ctx.open)
+            ):
+                raise Unstructurable("block outside of open try")
             first = False
             if n in self.emitted:
                 if self.dupable(n, ctx):
                     out.extend(self.dup(n))
+                    break
+                if self.tail_dupable(n, ctx):
+                    out.extend(copy.copy(st) for st in b.stmts)
+                    n = b.term.target
+                    continue
+                sub = self.terminal_subgraph(n, ctx) if self.dup_budget > 0 else None
+                if sub is not None:
+                    self.dup_budget -= 1
+                    out.extend(self.emit_copy(n, sub, ctx))
                     break
                 raise Unstructurable("block B%d emitted twice" % n)
             self.emitted.add(n)
@@ -455,15 +626,88 @@ class Structurer:
             cond, a, b = negate(t.cond), t.f, t.t
         else:
             cond, a, b = t.cond, t.t, t.f
-        inner = ctx.but(follow=follow)
+        inner = ctx.but(follow=follow if follow is not None else ctx.follow)
         then = self.seq(a, inner) if a != follow else []
         els = self.seq(b, inner) if b != follow else []
         return If(cond, then, els), follow
 
+    def latch_block(self, h, body, ctx):
+        """A single latch block (other than the header) reached from several
+        places is the target of `continue`; return it if its code can be
+        expressed as a for-loop update / do-while condition."""
+        blocks = self.blocks
+        latches = [p for p in self.g.all_preds[h] if p in body and h in blocks[p].succs]
+        if len(latches) != 1 or latches[0] == h:
+            return None
+        L = latches[0]
+        bl = blocks[L]
+        if len(bl.preds) < 2 or bl.handlers != ctx.open:
+            return None
+        for st in bl.stmts:
+            if not isinstance(st, (SetReg, ExprStmt)):
+                return None
+        t = bl.term
+        if isinstance(t, Jump):
+            return L
+        if isinstance(t, Branch) and h in (t.t, t.f) and t.t != t.f:
+            return L
+        return None
+
+    def loop_region(self, h, body, follow, ctx):
+        """The loop body plus exit paths that only the loop can reach (e.g.
+        a `return` inside the loop), which are emitted inside the loop."""
+        blocks = self.blocks
+        after = set()
+        if follow is not None:
+            stack = [follow]
+            while stack:
+                x = stack.pop()
+                if x in after:
+                    continue
+                after.add(x)
+                if x in ctx.region and x != h:
+                    stack.extend(all_succs(blocks[x]))
+        ext = set()
+        stack = [s for x in body for s in all_succs(blocks[x]) if s not in body]
+        while stack:
+            x = stack.pop()
+            if x in ext or x in body or x in after or x not in self.g.reach:
+                continue
+            if not dominates(self.g.idom, h, x):
+                continue
+            ext.add(x)
+            stack.extend(all_succs(blocks[x]))
+        return body | ext
+
     def emit_loop(self, h, ctx):
         body = self.g.loops[h] & ctx.region
         follow = self.loop_follow(h, body, ctx)
+        body = self.loop_region(h, body, follow, ctx) & ctx.region
         node = Loop([], self.new_label())
+        latch = self.latch_block(h, body, ctx)
+        if latch is not None:
+            lt = self.blocks[latch].term
+            if isinstance(lt, Branch):
+                other = lt.f if lt.t == h else lt.t
+                if other != follow:
+                    latch = None
+        if latch is not None:
+            # Prefer plain structuring; fall back to treating the latch as
+            # the `continue` target when that fails.
+            snap = (set(self.emitted), self.dup_budget, self.label_counter)
+            try:
+                return self.emit_plain_loop(h, body, follow, node, ctx)
+            except Unstructurable:
+                self.emitted, self.dup_budget, self.label_counter = (
+                    snap[0],
+                    snap[1],
+                    snap[2],
+                )
+                node = Loop([], self.new_label())
+                return self.emit_latch_loop(h, body, follow, latch, node, ctx)
+        return self.emit_plain_loop(h, body, follow, node, ctx)
+
+    def emit_plain_loop(self, h, body, follow, node, ctx):
         br = Breakable("loop", follow, h, node)
         inner = ctx.but(
             region=body,
@@ -478,6 +722,34 @@ class Structurer:
             pass
         return node, follow
 
+    def emit_latch_loop(self, h, body, follow, latch, node, ctx):
+        bl = self.blocks[latch]
+        self.emitted.add(latch)
+        br = Breakable("loop", follow, latch, node)
+        inner = ctx.but(
+            region=body - {latch},
+            follow=None,
+            breakables=ctx.breakables + [br],
+            fallthrough=None,
+            active_loops=ctx.active_loops | {h},
+        )
+        node.body = self.seq(h, inner, first=True)
+        exprs = []
+        for st in bl.stmts:
+            if isinstance(st, SetReg):
+                exprs.append(Assign(Reg(st.reg), st.value))
+            else:
+                exprs.append(st.e)
+        t = bl.term
+        if isinstance(t, Jump):
+            node.kind = "for"
+            node.update = (exprs[0] if len(exprs) == 1 else Seq(exprs)) if exprs else None
+        else:
+            c = t.cond if t.t == h else negate(t.cond)
+            node.kind = "dowhile"
+            node.cond = Seq(exprs + [c]) if exprs else c
+        return node, follow
+
     def loop_follow(self, h, body, ctx):
         blocks = self.blocks
         exits = []
@@ -489,21 +761,39 @@ class Structurer:
             return None
         if len(exits) == 1:
             return exits[0]
-        ht = blocks[h].term
-        if isinstance(ht, Branch):
-            outs = [s for s in (ht.t, ht.f) if s not in body]
-            if len(outs) == 1:
-                return outs[0]
-        # Prefer an exit that is not a small terminal block.
-        cand = [e for e in exits if not self.dupable(e, ctx) or e == ctx.follow]
+        jump_targets = set()
+        for br in ctx.breakables:
+            jump_targets.add(br.brk)
+            if br.cont is not None:
+                jump_targets.add(br.cont)
         if ctx.follow in exits:
             return ctx.follow
-        for br in reversed(ctx.breakables):
-            if br.brk in exits:
-                return br.brk
+        local = [e for e in exits if e not in jump_targets]
+        if len(local) == 1:
+            return local[0]
+        if not local:
+            for br in reversed(ctx.breakables):
+                if br.brk in exits:
+                    return br.brk
+            return exits[0]
+        ht = blocks[h].term
+        if isinstance(ht, Branch):
+            outs = [s for s in (ht.t, ht.f) if s not in body and s in local]
+            if len(outs) == 1:
+                return outs[0]
+        # The exit of a latch (back edge source) condition, as in do-while.
+        for p in self.g.all_preds[h]:
+            if p in body and h in blocks[p].succs:
+                pt = blocks[p].term
+                if isinstance(pt, Branch):
+                    outs = [s for s in (pt.t, pt.f) if s not in body and s in local]
+                    if len(outs) == 1:
+                        return outs[0]
+        # Prefer an exit that is not a small terminal block.
+        cand = [e for e in local if not self.dupable(e, ctx)]
         if cand:
             return max(cand, key=lambda k: self.g.rpo_index.get(k, 0))
-        return exits[0]
+        return local[0]
 
     def emit_try(self, n, h, ctx):
         blocks = self.blocks
@@ -547,14 +837,72 @@ class Structurer:
                 both = [x for x in c if x in exits and x in hexits]
                 pick = both or [x for x in c if x in exits] or c
                 follow = min(pick, key=lambda k: self.g.rpo_index.get(k, 0))
+        others = []
+        if follow is not None and follow != ctx.follow:
+            inner_open = ctx.but(open=ctx.open + [h])
+            others = [
+                x
+                for x in cands
+                if x != follow
+                and x not in jump_targets
+                and x != ctx.follow
+                and not self.dupable(x, inner_open)
+            ]
+            others.sort(key=lambda k: self.g.rpo_index.get(k, 0))
+        if not others:
+            body = self.seq(
+                n,
+                ctx.but(region=region, follow=follow, open=ctx.open + [h], fallthrough=None),
+                entry=True,
+            )
+            handler = self.seq(
+                h, ctx.but(region=ctx.region | hregion, follow=follow, fallthrough=None)
+            )
+            return Try(body, "ex", handler), follow
+        # Several exits: nest labeled blocks so that each exit is a forward
+        # `break label`.
+        #   F: { Xk: { ... X1: { try {...} catch {...} } X1-code ... } Xk-code }
+        node_f = Labeled(self.new_label().replace("loop", "blk"), [])
+        br_f = Breakable("block", follow, None, node_f)
+        nodes = []
+        brs = []
+        for x in others:
+            nd = Labeled(self.new_label().replace("loop", "blk"), [])
+            nodes.append(nd)
+            brs.append(Breakable("block", x, None, nd))
+        # Innermost breakable is X1 (others[0]).
+        inner_brs = ctx.breakables + [br_f] + list(reversed(brs))
         body = self.seq(
-            n, ctx.but(region=region, follow=follow, open=ctx.open + [h], fallthrough=None)
+            n,
+            ctx.but(
+                region=region,
+                follow=None,
+                open=ctx.open + [h],
+                fallthrough=None,
+                breakables=inner_brs,
+            ),
+            entry=True,
         )
-        hb = blocks[h]
         handler = self.seq(
-            h, ctx.but(region=ctx.region | hregion, follow=follow, fallthrough=None)
+            h,
+            ctx.but(
+                region=ctx.region | hregion,
+                follow=None,
+                fallthrough=None,
+                breakables=inner_brs,
+            ),
         )
-        return Try(body, "ex", handler), follow
+        cur = [Try(body, "ex", handler)]
+        for i, x in enumerate(others):
+            nodes[i].body = cur
+            outer_brs = ctx.breakables + [br_f] + list(reversed(brs[i + 1 :]))
+            code = self.seq(
+                x,
+                ctx.but(follow=None, fallthrough=None, breakables=outer_brs),
+            )
+            cur = [nodes[i]] + code
+        node_f.body = cur
+        return node_f, follow
 
     def emit_switch(self, n, t, ctx):
         blocks = self.blocks
@@ -659,6 +1007,22 @@ def _new_error(msg):
     return New(Name("Error", "builtin"), [Lit(msg)])
 
 
+def _clone(stmts):
+    out = []
+    for st in stmts:
+        st = copy.copy(st)
+        if isinstance(st, If):
+            st.then, st.els = _clone(st.then), _clone(st.els)
+        elif isinstance(st, (Loop, Labeled)):
+            st.body = _clone(st.body)
+        elif isinstance(st, Switch):
+            st.cases = [(l, _clone(b)) for l, b in st.cases]
+        elif isinstance(st, Try):
+            st.body, st.handler = _clone(st.body), _clone(st.handler)
+        out.append(st)
+    return out
+
+
 def _replace_caught(stmts, name):
     def fn(x):
         return Name(name, "catch") if isinstance(x, CaughtValue) else x
@@ -670,6 +1034,9 @@ def _replace_caught(stmts, name):
 
 
 def structure(blocks):
+    if not blocks:
+        return [], False
+    fold_constant_branches(blocks)
     merge_conditions(blocks)
     try:
         s = Structurer(blocks)

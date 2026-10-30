@@ -82,7 +82,13 @@ _IDENT_RE = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
 
 
 def is_identifier(s):
-    return isinstance(s, str) and bool(_IDENT_RE.match(s)) and s not in RESERVED
+    if not isinstance(s, str) or not s or s in RESERVED:
+        return False
+    if _IDENT_RE.match(s):
+        return True
+    # Non-ASCII identifiers: Python's rules (XID_Start/XID_Continue) are a
+    # close match for ECMAScript's ID_Start/ID_Continue.
+    return s.replace("$", "_").isidentifier()
 
 
 class Expr:
@@ -205,6 +211,11 @@ class Member(Expr):
     def __init__(self, obj, key):
         self.obj = obj
         self.key = key  # Expr
+
+    @property
+    def pure(self):
+        # Runtime helper lookups ($hbc.name) have no side effects.
+        return isinstance(self.obj, Name) and self.obj.kind == "helper"
 
     def children(self):
         return (self.obj, self.key)
@@ -336,6 +347,40 @@ class Assign(Expr):
                 Member(fn(self.target.obj), fn(self.target.key)), fn(self.value)
             )
         return Assign(self.target, fn(self.value))
+
+
+class Spread(Expr):
+    """`...e` in an array literal or argument list."""
+
+    __slots__ = ("e",)
+
+    def __init__(self, e):
+        self.e = e
+
+    def children(self):
+        return (self.e,)
+
+    def replace_children(self, fn):
+        return Spread(fn(self.e))
+
+
+class Seq(Expr):
+    """Comma expression."""
+
+    __slots__ = ("exprs",)
+
+    def __init__(self, exprs):
+        self.exprs = list(exprs)
+
+    @property
+    def pure(self):
+        return all(e.pure for e in self.exprs)
+
+    def children(self):
+        return tuple(self.exprs)
+
+    def replace_children(self, fn):
+        return Seq([fn(e) for e in self.exprs])
 
 
 class ObjectLit(Expr):
@@ -579,7 +624,7 @@ class If(Stmt):
 class Loop(Stmt):
     """kind: 'for' (infinite), 'while', 'dowhile'. label: str or None."""
 
-    __slots__ = ("kind", "cond", "body", "label", "used_label")
+    __slots__ = ("kind", "cond", "body", "label", "used_label", "update")
 
     def __init__(self, body, label):
         self.kind = "for"
@@ -587,6 +632,7 @@ class Loop(Stmt):
         self.body = body
         self.label = label
         self.used_label = False
+        self.update = None
 
 
 class Break(Stmt):
@@ -677,7 +723,7 @@ def stmt_exprs(s):
     if isinstance(s, If):
         return [s.cond]
     if isinstance(s, Loop):
-        return [s.cond] if s.cond is not None else []
+        return [x for x in (s.cond, s.update) if x is not None]
     if isinstance(s, Switch):
         out = [s.disc]
         for exprs, _ in s.cases:
@@ -724,6 +770,8 @@ def map_stmt_exprs(s, fn):
     elif isinstance(s, Loop):
         if s.cond is not None:
             s.cond = fn(s.cond)
+        if s.update is not None:
+            s.update = fn(s.update)
     elif isinstance(s, Switch):
         s.disc = fn(s.disc)
     elif isinstance(s, ForIn):
@@ -873,6 +921,8 @@ class Printer:
             a = self.expr(e.a, ind, PREC_ASSIGN)
             b = self.expr(e.b, ind, PREC_ASSIGN)
             return "%s ? %s : %s" % (c, a, b), PREC_COND
+        if isinstance(e, Seq):
+            return ", ".join(self.expr(x, ind, PREC_ASSIGN) for x in e.exprs), PREC_SEQ
         if isinstance(e, Assign):
             t = self.expr(e.target, ind, PREC_POSTFIX)
             v = self.expr(e.value, ind, PREC_ASSIGN)
@@ -884,8 +934,8 @@ class Printer:
             for el in e.elems:
                 if el is None:
                     parts.append("")
-                elif isinstance(el, tuple):
-                    parts.append("..." + self.expr(el[1], ind, PREC_ASSIGN))
+                elif isinstance(el, Spread):
+                    parts.append("..." + self.expr(el.e, ind, PREC_ASSIGN))
                 else:
                     parts.append(self.expr(el, ind, PREC_ASSIGN))
             s = ", ".join(parts)
@@ -934,8 +984,8 @@ class Printer:
     def _args(self, args, ind):
         parts = []
         for a in args:
-            if isinstance(a, tuple) and a[0] == "spread":
-                parts.append("..." + self.expr(a[1], ind, PREC_ASSIGN))
+            if isinstance(a, Spread):
+                parts.append("..." + self.expr(a.e, ind, PREC_ASSIGN))
             else:
                 parts.append(self.expr(a, ind, PREC_ASSIGN))
         return ", ".join(parts)
@@ -1022,7 +1072,12 @@ class Printer:
                 self.stmts(s.body, ind + 1, out)
                 out.append(pad + "} while (%s);" % self.expr(s.cond, ind))
             else:
-                out.append(pad + label + "for (;;) {")
+                cond = self.expr(s.cond, ind) if s.cond is not None else ""
+                upd = (" " + self.expr(s.update, ind)) if s.update is not None else ""
+                if s.cond is None and s.update is None:
+                    out.append(pad + label + "for (;;) {")
+                else:
+                    out.append(pad + label + "for (; %s;%s) {" % (cond, upd))
                 self.stmts(s.body, ind + 1, out)
                 out.append(pad + "}")
         elif isinstance(s, ForIn):

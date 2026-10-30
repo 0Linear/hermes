@@ -114,6 +114,25 @@ class DefineAccessor(Expr):
         )
 
 
+class CoerceThis(Expr):
+    """Sloppy-mode `this` coercion of a value."""
+
+    __slots__ = ("e",)
+
+    def __init__(self, e):
+        self.e = e
+
+    @property
+    def pure(self):
+        return self.e.pure
+
+    def children(self):
+        return (self.e,)
+
+    def replace_children(self, fn):
+        return CoerceThis(fn(self.e))
+
+
 class CaughtValue(Expr):
     """The exception value at the start of a catch handler."""
 
@@ -371,7 +390,10 @@ class FunctionLifter:
         self.uses_arguments = False
         self.max_param = func.paramCount - 1
         self.envs_created = []
-        self.created_envs = {}
+        # Environments are keyed by creation site and shared across
+        # re-processing of the same function.
+        self.created_envs = dec.created_envs.setdefault(func.index, {})
+        self.unknown_env = False
         # Child functions created here: fid -> Env or None.
         self.children = {}
 
@@ -391,8 +413,13 @@ class FunctionLifter:
     def param(self, i):
         if i == 0:
             return Name("this", "this")
-        self.max_param = max(self.max_param, i)
-        return Name("a%d" % (i - 1), "param")
+        if i < self.func.paramCount or self.fid in self.dec.generator_inner:
+            self.max_param = max(self.max_param, i)
+            return Name("a%d" % (i - 1), "param")
+        # Not a declared parameter (e.g. one with a default value): declaring
+        # it would change the function's `length`.
+        self.uses_arguments = True
+        return Member(Name("arguments", "arguments"), Lit(i - 1))
 
     def key(self, sid):
         return Lit(self.s(sid))
@@ -435,9 +462,10 @@ class FunctionLifter:
             if env is None:
                 env = Env(self.dec.new_env_id(), self.fid, parent, size, kind)
                 created[ins.offset] = env
-                self.envs_created.append(env)
             else:
                 env.parent = parent
+            if env not in self.envs_created:
+                self.envs_created.append(env)
             return env
 
         def walk(env, n):
@@ -478,13 +506,15 @@ class FunctionLifter:
                 elif op == "GetClosureEnvironment":
                     c = state.get(a[1])
                     if isinstance(c, ClosureVal):
-                        val = self.children.get(c.fid)
+                        val = self.children.get(c.fid) or self.dec.closure_env.get(c.fid)
                 elif op in ("Mov", "MovLong"):
                     val = state.get(a[1])
                 elif op in ("LoadFromEnvironment", "LoadFromEnvironmentL"):
                     e = state.get(a[1])
                     if isinstance(e, Env):
                         val = env_slots.get((e.eid, a[2]))
+                        if val is None:
+                            val = self.dec.closure_slots.get((e.eid, a[2])) or None
                 elif op in (
                     "StoreToEnvironment",
                     "StoreToEnvironmentL",
@@ -498,6 +528,13 @@ class FunctionLifter:
                             env_slots[(e.eid, a[1])] = v
                             self.dec.env_container[v.eid] = e
                             self.env_slots_changed = True
+                    elif isinstance(e, Env) and isinstance(v, ClosureVal):
+                        old = self.dec.closure_slots.get((e.eid, a[1]))
+                        if old is None:
+                            self.dec.closure_slots[(e.eid, a[1])] = v
+                            self.env_slots_changed = True
+                        elif old.fid != v.fid:
+                            self.dec.closure_slots[(e.eid, a[1])] = False
                 elif op in (
                     "CreateClosure",
                     "CreateClosureLongIndex",
@@ -549,6 +586,7 @@ class FunctionLifter:
     def env_var(self, ins, reg, slot):
         env = self.env_of(ins, reg)
         if env is None:
+            self.unknown_env = True
             return Name("$unknownEnv_r%d_%d" % (reg, slot), "env")
         return Name(env.slot_name(slot), "env")
 
@@ -667,7 +705,7 @@ class FunctionLifter:
             return [ExprStmt(Assign(self.env_var(ins, a[0], a[1]), R(a[2])))]
         if op in ("LoadFromEnvironment", "LoadFromEnvironmentL"):
             e = self.env_of(ins, a[1])
-            if e is not None and (e.eid, a[2]) in self.dec.env_slots:
+            if e is not None and isinstance(self.dec.env_slots.get((e.eid, a[2])), Env):
                 return set_(a[0], EnvRef(self.dec.env_slots[(e.eid, a[2])]))
             return set_(a[0], self.env_var(ins, a[1], a[2]))
         # ---- globals --------------------------------------------------
@@ -771,12 +809,16 @@ class FunctionLifter:
             this, args = self.call_args(a[3])
             return set_(a[0], hcall("callWithNewTarget", R(a[1]), R(a[2]), this, ArrayLit(args)))
         if op == "CallWithNewTargetLong":
-            # The argument count is in a register; we cannot know it
-            # statically. Pass the register through.
-            return set_(
-                a[0],
-                hcall("callWithNewTargetN", R(a[1]), R(a[2]), R(a[3]), Raw("/*frame args*/ []")),
-            )
+            # The argument count is in a register; it is always loaded from a
+            # constant just before the call.
+            argc = self.const_before(ins, b, a[3])
+            if not isinstance(argc, int) or isinstance(argc, bool):
+                return [Comment("unsupported: CallWithNewTargetLong with a dynamic argument count")]
+            this, args = self.call_args(argc)
+            nt = self.const_before(ins, b, a[2])
+            if nt is UNDEFINED:
+                return set_(a[0], CallT(R(a[1]), this, args))
+            return set_(a[0], hcall("callWithNewTarget", R(a[1]), R(a[2]), this, ArrayLit(args)))
         if op == "CallRequire":
             return set_(a[0], Call(R(a[1]), [Lit(a[2])]))
         if op in ("CallBuiltin", "CallBuiltinLong"):
@@ -808,6 +850,7 @@ class FunctionLifter:
         if op in ("CreateClosure", "CreateClosureLongIndex"):
             return set_(a[0], FuncExpr(a[2]))
         if op in ("CreateGenerator", "CreateGeneratorLongIndex"):
+            self.dec.generator_inner.add(a[2])
             return set_(a[0], hcall("createGenerator", FuncExpr(a[2])))
         if op in (
             "CreateBaseClass",
@@ -856,7 +899,7 @@ class FunctionLifter:
         if op == "LoadConstZero":
             return set_(a[0], Lit(0))
         if op == "CoerceThisNS":
-            return set_(a[0], R(a[1]))
+            return set_(a[0], CoerceThis(R(a[1])))
         if op == "LoadThisNS":
             return set_(a[0], Name("this", "this"))
         if op == "ToNumber":
@@ -920,6 +963,23 @@ class FunctionLifter:
             return br(Binary("!==", R(a[2]), builtin_expr(a[1])), ins.targets[0])
         return [Comment("unsupported instruction: " + disasm.format_instruction(self.hbc, ins))]
 
+    def const_before(self, ins, b, reg):
+        """The constant loaded into `reg` by the closest preceding instruction
+        in block b that writes it, or None."""
+        idx = b.insns.index(ins)
+        for prev in reversed(b.insns[:idx]):
+            if reg in _defined_regs(prev):
+                if prev.op in ("LoadConstUInt8", "LoadConstInt"):
+                    return prev.args[1]
+                if prev.op == "LoadConstDouble" and prev.args[1] == int(prev.args[1]):
+                    return int(prev.args[1])
+                if prev.op == "LoadConstZero":
+                    return 0
+                if prev.op == "LoadConstUndefined":
+                    return UNDEFINED
+                return None
+        return None
+
     def _env_after(self, ins):
         # Fallback: recompute the value the instruction defines.
         op, a = ins.op, ins.args
@@ -937,7 +997,7 @@ class FunctionLifter:
         if op == "GetClosureEnvironment":
             c = state.get(a[1])
             if isinstance(c, ClosureVal):
-                return self.children.get(c.fid)
+                return self.children.get(c.fid) or self.dec.closure_env.get(c.fid)
         return None
 
     def lit(self, v):

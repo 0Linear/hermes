@@ -19,6 +19,9 @@ from .jsast import (
     Branch,
     Call,
     Comment,
+    Cond,
+    Logical,
+    Seq,
     Expr,
     ExprStmt,
     FuncExpr,
@@ -30,14 +33,17 @@ from .jsast import (
     Reg,
     Return,
     SetReg,
+    Spread,
     SwitchTerm,
     Throw,
+    Unary,
     VarDecl,
     stmt_exprs,
 )
 from .lifter import (
     CallT,
     CaughtValue,
+    CoerceThis,
     ConstructT,
     CreateThis,
     DefineAccessor,
@@ -444,7 +450,13 @@ def fold_blocks(blocks, ctx):
 
 def _fold_stmt(s, live, handler_live, out, ctx):
     """Fold definitions from `out` into statement s. Returns the (possibly
-    replaced) statement or None if it was absorbed."""
+    replaced) statement or None if it was absorbed.
+
+    Every folded expression with side effects is tagged with its original
+    position, and a fold is only accepted if the evaluation order of all side
+    effects in the resulting statement matches the original order."""
+    stamp = {id(st): i for i, st in enumerate(out)}
+    origin = {}
     progress = True
     while progress:
         progress = False
@@ -455,7 +467,6 @@ def _fold_stmt(s, live, handler_live, out, ctx):
         if not regs:
             break
         sdef = stmt_def(s)
-        limit = len(out)
         seen = set()
         for n in reversed(regs):
             if n in seen:
@@ -480,28 +491,66 @@ def _fold_stmt(s, live, handler_live, out, ctx):
                 continue
             d = out[pos]
             val = d.value
+            p = stamp.get(id(d), -1)
             if not val.pure:
-                if pos >= limit:
+                if any(not stmt_is_pure(out[j]) for j in range(pos + 1, len(out))):
                     continue
-                if any(not stmt_is_pure(out[j]) for j in range(pos + 1, limit)):
-                    continue
-                if any(not stmt_is_pure(out[j]) for j in range(limit, len(out))):
+                if not _order_ok(s, n, p, origin):
                     continue
             vregs = set(expr_regs(val, []))
             if any(_defines_any(out[j], vregs) for j in range(pos + 1, len(out))):
                 continue
-            if sdef is not None and sdef in vregs and not _value_only(s):
-                continue
             # Fold.
             del out[pos]
             if not val.pure:
-                limit = pos
-            elif pos < limit:
-                limit -= 1
+                origin[id(val)] = p
             _map_into(s, n, val)
             progress = True
             break
     return s
+
+
+_INF = float("inf")
+
+
+def _self_effect(e):
+    if e.pure:
+        return False
+    return not isinstance(e, (Logical, Cond, Seq, ObjectLit, ArrayLit))
+
+
+def _order_ok(s, n, p, origin):
+    """Would evaluating a side effect from original position p at the slot of
+    Reg(n) in s keep all side effects in their original order?"""
+    events = []
+    found = [False]
+
+    def walk(e, tag):
+        tag = origin.get(id(e), tag)
+        if isinstance(e, Reg):
+            if e.n == n:
+                found[0] = True
+                events.append(None)
+            return
+        for c in e.children():
+            walk(c, tag)
+        if _self_effect(e):
+            events.append(tag)
+
+    for e in stmt_exprs(s):
+        walk(e, _INF)
+    if not found[0]:
+        return False
+    before = True
+    for ev in events:
+        if ev is None:
+            before = False
+        elif before:
+            if not ev < p:
+                return False
+        elif not ev > p:
+            return False
+    return True
 
 
 def _value_only(s):
@@ -539,6 +588,12 @@ def simplify_expr(e):
                     return x
         if isinstance(x, SelectObj) and isinstance(x.ret, New):
             return x.ret
+        if _is_helper_call(x, "apply") and len(x.args) in (2, 3) and isinstance(x.args[1], ArrayLit):
+            elems = x.args[1].elems
+            if all(el is not None for el in elems):
+                if len(x.args) == 3:
+                    return CallT(x.args[0], x.args[2], list(elems))
+                return New(x.args[0], list(elems))
         return x
 
     return _transform(e, fn)
@@ -580,25 +635,86 @@ def _simplify_stmt(s, out, live, ctx):
             return _fold_define(s, e, out)
         if isinstance(e, DefineAccessor) and isinstance(e.obj, Reg) and e.enumerable:
             return _fold_accessor(s, e, out)
-        if (
-            isinstance(e, Call)
-            and isinstance(e.callee, Member)
-            and isinstance(e.callee.obj, Name)
-            and e.callee.obj.name == "$hbc"
-            and isinstance(e.callee.key, Lit)
-            and e.callee.key.v == "putSlot"
-            and isinstance(e.args[0], Reg)
-        ):
+        if _is_helper_call(e, "putSlot") and isinstance(e.args[0], Reg):
             return _fold_put_slot(s, e, out)
+        if _is_helper_call(e, "arraySpread") and len(e.args) == 3 and isinstance(e.args[0], Reg):
+            return _fold_spread(s, e, out, None, live)
+    if isinstance(s, SetReg):
+        e = s.value
+        if _is_helper_call(e, "arraySpread") and len(e.args) == 3 and isinstance(e.args[0], Reg):
+            return _fold_spread(s, e, out, s.reg, live)
     return s
+
+
+def _is_helper_call(e, name):
+    return (
+        isinstance(e, Call)
+        and isinstance(e.callee, Member)
+        and isinstance(e.callee.obj, Name)
+        and e.callee.obj.name == "$hbc"
+        and isinstance(e.callee.key, Lit)
+        and e.callee.key.v == name
+    )
+
+
+def _fold_spread(s, e, out, result_reg, live):
+    """[...elems] + arraySpread(R, X, n) -> R = [...elems, ...X]. If the next
+    index is used, it is re-expressed as R.length."""
+    n = e.args[0].n
+    idx = e.args[2]
+    skip = None
+    if isinstance(idx, Reg):
+        # Index produced by an earlier spread into the same array.
+        for j in range(len(out) - 1, -1, -1):
+            st = out[j]
+            if stmt_def(st) == idx.n:
+                v = st.value
+                if (
+                    isinstance(v, Member)
+                    and isinstance(v.obj, Reg)
+                    and v.obj.n == n
+                    and isinstance(v.key, Lit)
+                    and v.key.v == "length"
+                ):
+                    skip = j
+                break
+        if skip is None or idx.n in live or idx.n == result_reg:
+            return s
+        if any(_reads(out[k], idx.n) for k in range(skip + 1, len(out))):
+            return s
+    j = _find_literal_def(out, n, skip)
+    if j is None or not isinstance(out[j].value, ArrayLit):
+        return s
+    lit = out[j].value
+    if skip is None:
+        if not (isinstance(idx, Lit) and idx.v == len(lit.elems)):
+            return s
+        if any(isinstance(x, Spread) for x in lit.elems):
+            return s
+    if any(x is None for x in lit.elems):
+        return s
+    if _reg_count(e.args[1], n):
+        return s
+    if not _can_move_to_end(out, j):
+        return s
+    if skip is not None:
+        del out[skip]
+    del out[j]
+    new = SetReg(n, ArrayLit(lit.elems + [Spread(e.args[1])]))
+    if result_reg is None or result_reg == n:
+        return new
+    out.append(new)
+    return SetReg(result_reg, Member(Reg(n), Lit("length")))
 
 
 def _same_callee(a, b):
     return _same(a, b) or (isinstance(a, Reg) and isinstance(b, Reg) and a.n == b.n)
 
 
-def _find_literal_def(out, n):
+def _find_literal_def(out, n, skip=None):
     for j in range(len(out) - 1, -1, -1):
+        if j == skip:
+            continue
         st = out[j]
         if stmt_def(st) == n:
             if isinstance(st.value, (ObjectLit, ArrayLit)):
@@ -646,7 +762,11 @@ def _fold_define(s, e, out):
         elems = list(lit.elems)
         if idx == len(elems):
             elems.append(e.value)
-        elif idx < len(elems) and elems[idx] is None:
+        elif (
+            idx < len(elems)
+            and elems[idx] is None
+            and all(x is None or isinstance(x, Lit) for x in elems[idx + 1 :])
+        ):
             elems[idx] = e.value
         else:
             return s
@@ -694,6 +814,10 @@ def _fold_put_slot(s, e, out):
     if _reg_count(e.args[2], n):
         return s
     props = list(lit.props)
+    # The new value is evaluated at its position in the literal; that must not
+    # move it before side effects of later entries.
+    if any(not isinstance(v, Lit) for _, _, v in props[own[idx] + 1 :]):
+        return s
     k, key, _ = props[own[idx]]
     props[own[idx]] = (k, key, e.args[2])
     del out[j]
@@ -735,6 +859,10 @@ def finalize_expr(e, declared_globals):
                 return Member(x.obj, x.key)
         if isinstance(x, TryMember):
             return Member(x.obj, x.key)
+        if isinstance(x, CoerceThis):
+            if isinstance(x.e, Name) and x.e.kind == "this":
+                return x.e
+            return Call(Member(Name("$hbc", "helper"), Lit("coerceThis")), [x.e])
         if isinstance(x, Assign) and isinstance(x.target, Member):
             t = x.target
             if _is_global_obj(t.obj) and isinstance(t.key, Lit):
@@ -750,6 +878,10 @@ def finalize_expr(e, declared_globals):
         if isinstance(x, Binary) and x.op in ("===", "!==", "==", "!="):
             if isinstance(x.l, Lit) and not isinstance(x.r, Lit):
                 return Binary(x.op, x.r, x.l)
+        if isinstance(x, Unary) and x.op == "!" and isinstance(x.e, Binary):
+            inv = {"===": "!==", "!==": "===", "==": "!=", "!=": "=="}.get(x.e.op)
+            if inv:
+                return Binary(inv, x.e.l, x.e.r)
         if isinstance(x, DefineProp):
             return _define_prop_call(x)
         from .lifter import DefineAccessor
