@@ -116,7 +116,8 @@ benchmarks. For most of the remaining differences the program inspects its own
 source: stack traces and line numbers, `Function.prototype.toString`, function
 `name` and `length`, or error message text. Octane programs check their own
 results. At `-O`, richards, deltablue, raytrace, crypto, navier-stokes, splay,
-regexp, box2d, gbemu, typescript and pdfjs pass after decompilation (earley-boyer
+regexp, box2d, gbemu, typescript, pdfjs and zlib (slowly, see Limitations) pass
+after decompilation (earley-boyer
 does not, see Limitations; it passes at `-O0`), including typescript (2.5 MB of source, 1,561
 functions, about 6 seconds to decompile) and pdfjs (one function holding
 1.1 MB of bytecode, about a minute).
@@ -138,6 +139,6 @@ functions, about 6 seconds to decompile) and pdfjs (one function holding
   `Generator` instances (`instanceof` and the prototype chain differ).
 - Functions that fall back to the dispatch loop run correctly but slowly. In
   the zlib Octane benchmark (Emscripten output) a few hot functions take this
-  form, and the decompiled program ran for over 30 minutes without finishing,
-  against about 70 seconds for the original bytecode.
+  form; the decompiled program passes its self-check but takes about 43
+  minutes, against about 70 seconds for the original bytecode.
 - Delta-form ("delta prepped") bytecode is not supported.
